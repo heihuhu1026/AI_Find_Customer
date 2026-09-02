@@ -9,6 +9,8 @@
 
 AI Hunter 是一个面向外贸与 B2B 线索挖掘场景的开源版项目。你只需要提供公司官网、产品文档或产品关键词，再指定目标市场，系统就会自动完成公司理解、关键词生成、网页搜索、线索提取和联系方式发现。
 
+> 本项目基于 [xiongQvQ/AI_Find_Customer](https://github.com/xiongQvQ/AI_Find_Customer) 二次开发，原项目采用 [MIT License](LICENSE)。
+
 ## 开源仓库范围
 
 这次公开的开源仓库只保留以下内容：
