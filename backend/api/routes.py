@@ -625,6 +625,10 @@ async def _run_hunt(hunt_id: str, request: HuntRequest) -> None:
 
     set_progress_callback(_on_lead_progress)
 
+    # Initialize accumulated BEFORE the try block so exception handlers
+    # (cancel / failure paths) can always reference it safely.
+    accumulated: dict[str, Any] = dict(initial_state)
+
     try:
         _raise_if_hunt_cancelled(hunt_id)
         graph = build_graph(
@@ -641,7 +645,6 @@ async def _run_hunt(hunt_id: str, request: HuntRequest) -> None:
         # Use astream to get intermediate state updates and accumulate final result
         prev_stage = "start"
         prev_round = 1
-        accumulated: dict[str, Any] = dict(initial_state)
 
         async for chunk in graph.astream(initial_state):
             _raise_if_hunt_cancelled(hunt_id)
@@ -887,6 +890,10 @@ async def _run_resume_hunt(hunt_id: str, request: ResumeRequest, prior_result: d
 
     set_progress_callback(_on_lead_progress)
 
+    # Initialize accumulated BEFORE the try block so exception handlers
+    # (cancel / failure paths) can always reference it safely.
+    accumulated: dict[str, Any] = dict(initial_state)
+
     try:
         _raise_if_hunt_cancelled(hunt_id)
         graph = build_graph(
@@ -902,7 +909,6 @@ async def _run_resume_hunt(hunt_id: str, request: ResumeRequest, prior_result: d
 
         prev_stage = "start"
         prev_round = 1
-        accumulated: dict[str, Any] = dict(initial_state)
 
         async for chunk in graph.astream(initial_state):
             _raise_if_hunt_cancelled(hunt_id)

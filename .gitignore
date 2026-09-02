@@ -110,3 +110,11 @@ logs/
 
 # ── License server runtime ───────────────────────────────────
 license-server/.env
+
+# ── Local test artifacts & run outputs (never commit) ──────
+hunt_*.json
+backend/leads_*.csv
+backend/leads_report_*.html
+backend/_make_report.py
+start-backend.bat
+start-frontend.bat

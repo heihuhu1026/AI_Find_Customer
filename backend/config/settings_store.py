@@ -17,6 +17,9 @@ _LLM_KEYS = {
     "ZAI_API_KEY",
     "MOONSHOT_API_KEY",
     "MINIMAX_API_KEY",
+    "DASHSCOPE_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "VOLCENGINE_API_KEY",
 }
 
 
@@ -65,6 +68,14 @@ def update_settings(updates: dict[str, str]) -> None:
     existing = read_settings()
     existing.update(updates)
     write_settings(existing)
+    # Force the cached settings singleton to re-read from .env on next use.
+    # Without this, a running server keeps stale values until a manual restart.
+    try:
+        from config.settings import reload_settings
+
+        reload_settings()
+    except Exception:  # pragma: no cover - never block a settings save
+        pass
 
 
 def is_configured() -> bool:

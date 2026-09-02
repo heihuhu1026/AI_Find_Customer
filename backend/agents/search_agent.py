@@ -9,6 +9,7 @@ from typing import Any
 from config.settings import get_settings
 from graph.state import HuntState
 from tools.google_maps_search import GoogleMapsSearchTool
+from tools.google_search import GoogleSearchTool  # routes to Brave when BRAVE_API_KEY is set
 from tools.platform_registry import PlatformRegistryTool  # backward-compatible patch target
 from tools.web_search import WebSearchTool  # backward-compatible patch target
 
@@ -256,6 +257,56 @@ async def _maps_search_keyword(
             }
 
 
+async def _web_search_keyword(
+    keyword: str,
+    web_tool: "GoogleSearchTool",
+    semaphore: asyncio.Semaphore,
+    *,
+    gl: str = "",
+    hl: str = "",
+) -> dict:
+    """Discover businesses via general web search (Brave) for a keyword.
+
+    Used as a free fallback when Google Maps / Serper is not configured.
+    Returns the same normalized row schema as the Maps path (link/title/snippet),
+    with an empty maps_data so downstream lead extraction treats it as a website.
+    """
+    async with semaphore:
+        try:
+            logger.info("[WebSearch] query=%r gl=%s hl=%s", keyword, gl or "(none)", hl or "(none)")
+            raw = await web_tool.search(keyword, num=10, gl=gl, hl=hl)
+            results = []
+            for item in raw:
+                link = (item.get("link") or "").strip()
+                if not link:
+                    continue
+                results.append({
+                    "title": item.get("title", ""),
+                    "link": link,
+                    "snippet": item.get("snippet", ""),
+                    "position": item.get("position", 0),
+                    "source": "brave",
+                    "maps_data": {},
+                })
+            logger.info("[WebSearch] query=%r → %d results", keyword, len(results))
+            return {
+                "keyword": keyword,
+                "results": results,
+                "result_count": len(results),
+                "source": "brave",
+                "error": None,
+            }
+        except Exception as e:
+            logger.warning("[WebSearch] FAILED query=%r: %s", keyword, e)
+            return {
+                "keyword": keyword,
+                "results": [],
+                "result_count": 0,
+                "source": "brave",
+                "error": str(e),
+            }
+
+
 async def search_node(state: HuntState) -> dict:
     """LangGraph node: Google Maps-only search for all round keywords."""
     settings = get_settings()
@@ -277,18 +328,39 @@ async def search_node(state: HuntState) -> dict:
         logger.info("[SearchAgent] No geo params resolved from regions=%s, searching globally", target_regions)
 
     semaphore = asyncio.Semaphore(settings.search_concurrency)
-    maps_tool = GoogleMapsSearchTool(settings)
 
-    search_tasks = [
-        _maps_search_keyword(kw, maps_tool, semaphore, gl=gl, hl=hl)
-        for kw in keywords
-    ]
-    logger.info(
-        "[SearchAgent] Tool routing: regions=%s → %s",
-        target_regions,
-        ["google_maps(serper)"],
+    # Resilient backend selection (priority order):
+    #   * Serper configured  -> Google Maps (richest local-business data) [primary]
+    #   * Brave/Tavily        -> general web search (free, auto Brave->Tavily) [fallback]
+    #   * neither             -> skip discovery
+    maps_tool = GoogleMapsSearchTool(settings) if settings.serper_api_key else None
+    web_tool = (
+        GoogleSearchTool(settings)
+        if (settings.brave_api_key or settings.tavily_api_key)
+        else None
     )
-    logger.info("[SearchAgent] Launching %d maps tasks (concurrency=%d)", len(search_tasks), settings.search_concurrency)
+
+    if maps_tool:
+        backend = "google_maps"
+        search_tasks = [
+            _maps_search_keyword(kw, maps_tool, semaphore, gl=gl, hl=hl)
+            for kw in keywords
+        ]
+        logger.info("[SearchAgent] Tool routing: %s -> google_maps(serper) [primary]", target_regions)
+    elif web_tool:
+        backend = "web"
+        search_tasks = [
+            _web_search_keyword(kw, web_tool, semaphore, gl=gl, hl=hl)
+            for kw in keywords
+        ]
+        logger.info("[SearchAgent] Tool routing: %s -> web(brave/tavily) [primary]", target_regions)
+    else:
+        logger.warning(
+            "[SearchAgent] No SERPER_API_KEY / BRAVE_API_KEY / TAVILY_API_KEY; skipping discovery"
+        )
+        return {"current_stage": "search"}
+
+    logger.info("[SearchAgent] Launching %d %s tasks (concurrency=%d)", len(search_tasks), backend, settings.search_concurrency)
 
     raw_results = []
     for future in asyncio.as_completed(search_tasks):
@@ -296,6 +368,29 @@ async def search_node(state: HuntState) -> dict:
             raw_results.append(await future)
         except Exception as e:
             logger.error("[SearchAgent] Task failed: %s", e)
+
+    # ── Resilient fallback: primary Maps returned nothing -> web (Brave/Tavily) ──
+    _primary_total = sum(r.get("result_count", 0) for r in raw_results)
+    if maps_tool and web_tool and backend == "google_maps" and _primary_total == 0:
+        logger.warning(
+            "[SearchAgent] Google Maps returned 0 results (Serper likely unreachable); "
+            "falling back to web search (Brave/Tavily)"
+        )
+        backend = "web"
+        web_tasks = [
+            _web_search_keyword(kw, web_tool, semaphore, gl=gl, hl=hl)
+            for kw in keywords
+        ]
+        raw_results = []
+        for future in asyncio.as_completed(web_tasks):
+            try:
+                raw_results.append(await future)
+            except Exception as e:
+                logger.error("[SearchAgent] Web fallback task failed: %s", e)
+        logger.info(
+            "[SearchAgent] Web fallback produced %d raw results",
+            sum(r.get("result_count", 0) for r in raw_results),
+        )
 
     all_results = state.get("search_results", [])
     keyword_stats: dict[str, Any] = dict(state.get("keyword_search_stats", {}))
@@ -335,10 +430,12 @@ async def search_node(state: HuntState) -> dict:
         except Exception:
             pass
 
-    try:
-        await maps_tool.close()
-    except Exception as e:
-        logger.warning("[SearchAgent] Error closing tools: %s", e)
+    for _t in (maps_tool, web_tool):
+        if _t is not None:
+            try:
+                await _t.close()
+            except Exception as e:
+                logger.warning("[SearchAgent] Error closing tool: %s", e)
 
     logger.info(
         "[SearchAgent] Completed — %d new results (total: %d)",

@@ -20,9 +20,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
+import threading
+import time
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
+
+import httpx
 
 from config.settings import get_settings
 from graph.state import HuntState
@@ -51,6 +56,101 @@ logger = logging.getLogger(__name__)
 _progress_callback: Callable[[dict], None] | None = None
 
 
+# --- Token-optimization helpers (see TOKEN_OPTIMIZATION_PLAN.md) ---
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+_PHONE_RE = re.compile(r"(?:\+?\d[\d\s().-]{7,}\d)")
+
+
+def _compress_scrape_for_history(content: str, head: int = 3000) -> str:
+    """Shrink a scraped page to a history-friendly size.
+
+    Keeps the leading ``head`` chars (company identity + description) and
+    re-appends any emails/phones found anywhere in the page, so downstream
+    ``extract_lead_info`` still sees contacts after trimming. Prevents the full
+    page from being re-sent on every ReAct iteration (biggest token waste).
+    """
+    body = content[:head]
+    extras: list[str] = []
+    seen: set[str] = set()
+    for m in list(_EMAIL_RE.finditer(content)) + list(_PHONE_RE.finditer(content)):
+        frag = m.group(0).strip()
+        if frag and frag not in seen:
+            seen.add(frag)
+            extras.append(frag)
+    if extras:
+        body += "\n\n[Contact snippets]\n" + "\n".join(extras[:40])
+    return body
+
+
+# --- Page + extraction caches (token optimization: D1/D2, see TOKEN_OPTIMIZATION_PLAN.md) ---
+_PAGE_CACHE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "page_cache.json"
+)
+_PAGE_CACHE_TTL = 24 * 3600  # 24h
+_PAGE_CACHE_LOCK = threading.Lock()
+_page_cache_mem: dict = {}
+
+
+def _norm_url(url: str) -> str:
+    try:
+        p = urlparse(url)
+        host = p.netloc.lower()
+        path = p.path.rstrip("/")
+        return urlunparse((p.scheme.lower(), host, path, "", "", ""))
+    except Exception:
+        return url.strip().rstrip("/")
+
+
+def _page_cache_load() -> dict:
+    global _page_cache_mem
+    if _page_cache_mem:
+        return _page_cache_mem
+    with _PAGE_CACHE_LOCK:
+        if not _page_cache_mem:
+            try:
+                if os.path.exists(_PAGE_CACHE_PATH):
+                    _page_cache_mem = json.load(open(_PAGE_CACHE_PATH, encoding="utf-8"))
+                else:
+                    _page_cache_mem = {}
+            except Exception:
+                _page_cache_mem = {}
+    return _page_cache_mem
+
+
+def _page_cache_get(url: str):
+    c = _page_cache_load()
+    k = _norm_url(url)
+    with _PAGE_CACHE_LOCK:
+        e = c.get(k)
+    if not e:
+        return None
+    if time.time() - e.get("ts", 0) > _PAGE_CACHE_TTL:
+        return None
+    return e.get("content")
+
+
+def _page_cache_put(url: str, content: str) -> None:
+    c = _page_cache_load()
+    k = _norm_url(url)
+    with _PAGE_CACHE_LOCK:
+        c[k] = {"content": content, "ts": int(time.time())}
+        try:
+            os.makedirs(os.path.dirname(_PAGE_CACHE_PATH), exist_ok=True)
+            json.dump(c, open(_PAGE_CACHE_PATH, "w", encoding="utf-8"))
+        except Exception:
+            pass
+
+
+# In-memory result caches for deterministic-ish LLM calls (D2)
+_extract_cache: dict = {}
+_assess_cache: dict = {}
+cache_stats = {"page_hits": 0, "page_miss": 0, "extract_hits": 0, "assess_hits": 0}
+
+
+def _hash(s: str) -> str:
+    return str(hash(s))
+
+
 def _candidate_budget(target_lead_count: int, scrape_concurrency: int) -> int:
     """Return a bounded candidate budget for deep extraction.
 
@@ -60,7 +160,10 @@ def _candidate_budget(target_lead_count: int, scrape_concurrency: int) -> int:
     """
     target = max(1, int(target_lead_count or 0))
     concurrency = max(1, int(scrape_concurrency or 0))
-    return max(12, target * 4, concurrency * 4)
+    # 1.1: halve the lead-count multiple (target*4 -> target*2) to cut ReAct
+    # deep-extraction loops ~50% for large hunts. Hard cap prevents runaway on
+    # extreme targets.
+    return min(200, max(12, target * 2, concurrency * 4))
 
 
 def set_progress_callback(cb: Callable[[dict], None] | None) -> None:
@@ -483,14 +586,61 @@ If uncertain, keep it.
 
 # ── Scrape & extract helpers ─────────────────────────────────────────────
 
+async def _direct_fetch(url: str) -> str:
+    """Best-effort fallback page fetch via plain HTTP.
+
+    Used when Jina Reader is disabled or blocked (e.g. an egress proxy that
+    only whitelists certain hosts). Many company sites are directly reachable,
+    so a plain GET + tag strip still yields enough text for lead extraction —
+    far better than returning nothing and letting the ReAct agent go blind.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, trust_env=True) as client:
+            resp = await client.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; LeadBot/1.0)"},
+            )
+            if resp.status_code != 200:
+                return ""
+            html = resp.text or ""
+            if not html:
+                return ""
+            # Strip <script>/<style> blocks, then all tags, then collapse whitespace.
+            body = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
+            body = re.sub(r"<[^>]+>", " ", body)
+            body = re.sub(r"\s+", " ", body).strip()
+            return body[:8000]
+    except Exception as e:
+        logger.debug("[LeadExtract] Direct fetch failed for %s: %s", url, e)
+        return ""
+
+
 async def _scrape_page(jina: JinaReaderTool, url: str) -> str:
-    """Scrape a single page, returning content or empty string on failure."""
+    """Scrape a single page, returning content or empty string on failure.
+
+    Tries Jina Reader first; if it is disabled/blocked/empty, falls back to a
+    direct HTTP fetch so lead extraction still has page content to work with.
+    Results are cached on disk (D1) so multi-round hunts / resume reuse pages
+    instead of re-fetching.
+    """
+    cached = _page_cache_get(url)
+    if cached:
+        cache_stats["page_hits"] += 1
+        logger.debug("[LeadExtract] page cache HIT %s", url)
+        return cached
+    cache_stats["page_miss"] += 1
     try:
         content = await jina.read(url)
-        return content if content and len(content.strip()) >= 50 else ""
+        if content and len(content.strip()) >= 50:
+            _page_cache_put(url, content)
+            return content
     except Exception as e:
-        logger.debug("Failed to scrape %s: %s", url, e)
-        return ""
+        logger.debug("[LeadExtract] Jina scrape failed for %s: %s", url, e)
+    # Fallback: direct HTTP GET (works when Jina Reader is unavailable).
+    direct = await _direct_fetch(url)
+    if direct:
+        _page_cache_put(url, direct)
+    return direct if direct else ""
 
 
 def _extract_contacts_from_text(text: str) -> tuple[list[str], list[str], dict[str, str]]:
@@ -689,8 +839,12 @@ def _build_react_tools(
         content = await _scrape_page(jina, url)
         if not content:
             return json.dumps({"error": "Failed to scrape page or page has no content", "url": url})
-        # Truncate to avoid huge tool results
-        truncated = content[:6000]
+        # 1.2 + B1: cap the history page entry at `head` chars (3000) and
+        # re-scan the FULL page for contacts so extract_lead_info downstream
+        # still sees emails/phones even when the body is trimmed. This stops
+        # the full page from being re-sent on every ReAct iteration (biggest
+        # single token waste) WITHOUT losing contact info.
+        compressed = _compress_scrape_for_history(content, head=3000)
         # Auto-extract contacts from the FULL content (not truncated)
         emails, phones, social = _extract_contacts_from_text(content)
         # Collect into the shared accumulator for post-hoc merge (P0-3)
@@ -703,7 +857,7 @@ def _build_react_tools(
         # Discover contact page links
         contact_links = discover_contact_pages(content, url)
         result: dict[str, Any] = {
-            "content": truncated,
+            "content": compressed,
             "content_length": len(content),
             "extracted_emails": emails,
             "extracted_phones": phones,
@@ -750,7 +904,12 @@ def _build_react_tools(
         """Use AI to extract structured company facts from page content (no scoring)."""
         if not page_content.strip():
             return json.dumps({"error": "page_content is required — pass the scraped text"})
-        prompt = f"## Page Content\n{page_content[:5000]}"
+        prompt = f"## Page Content\n{page_content[:3500]}"
+        key = _hash(prompt)
+        if key in _extract_cache:
+            cache_stats["extract_hits"] += 1
+            logger.debug("[LeadExtract] extract cache HIT")
+            return _extract_cache[key]
         try:
             raw = await llm.generate(
                 prompt,
@@ -758,6 +917,7 @@ def _build_react_tools(
                 temperature=0.1,
                 response_format={"type": "json_object"},
             )
+            _extract_cache[key] = raw
             return raw
         except Exception as e:
             return json.dumps({"error": f"LLM extraction failed: {e}"})
@@ -790,34 +950,23 @@ def _build_react_tools(
         """Score how well a company fits as a buyer/distributor using the full insight context."""
         if not company_profile.strip():
             return json.dumps({"error": "company_profile is required — pass the full extracted company JSON"})
-        # Build rich seller context from insight
+        # B3: lean seller context. The full insight is already in the ReAct
+        # user_prompt; re-injecting it all here wastes tokens on a *standalone*
+        # LLM call. Keep only what scoring strictly needs.
         products = ", ".join(insight.get("products", []))
-        industries = ", ".join(insight.get("industries", []))
-        value_props = "; ".join(insight.get("value_propositions", []))
         target_profile = insight.get("target_customer_profile", "B2B buyer")
         target_regions = ", ".join(insight.get("recommended_regions", []))
-        summary = insight.get("summary", "")
         negative_criteria = insight.get("negative_targeting_criteria", [])
         negative_text = "\n".join(f"- {c}" for c in negative_criteria) if negative_criteria else "None"
-        seller_name = insight.get("company_name", "Our Company")
-        # Derive preferred buyer types from target_customer_profile if available
         buyer_type_hint = "distributor, importer, wholesaler, agent, or reseller"
         if target_profile:
-            # Extract business type keywords from the ICP description
             icp_lower = target_profile.lower()
-            types = []
-            for t in ["distributor", "importer", "wholesaler", "reseller", "retailer", "agent", "installer", "integrator"]:
-                if t in icp_lower:
-                    types.append(t)
+            types = [t for t in ("distributor", "importer", "wholesale", "reseller", "retailer", "agent", "installer", "integrator") if t in icp_lower]
             if types:
                 buyer_type_hint = ", ".join(types)
         prompt = (
-            f"## Prospect Company Profile\n{company_profile[:3000]}\n\n"
-            f"## Seller: {seller_name}\n"
-            f"Products: {products}\n"
-            f"Target industries: {industries}\n"
-            f"Value propositions: {value_props}\n"
-            f"Company summary: {summary}\n\n"
+            f"## Prospect Company Profile\n{company_profile[:2000]}\n\n"
+            f"## Products We Sell\n{products}\n\n"
             f"## Ideal Customer Profile (ICP)\n{target_profile}\n\n"
             f"## Preferred Buyer Types\n{buyer_type_hint}\n\n"
             f"## Negative Criteria (Knockout)\n{negative_text}\n\n"
@@ -825,9 +974,13 @@ def _build_react_tools(
             f"## Your Task\n"
             f"Score this prospect against the 4 dimensions. "
             f"For each fit_reason, cite SPECIFIC facts from the company profile above "
-            f"(their actual products, location, business type, customer base) and explain "
-            f"WHY those facts make them a good match for {seller_name}'s products ({products})."
+            f"and explain WHY those facts make them a good match for our products ({products})."
         )
+        key = _hash(prompt)
+        if key in _assess_cache:
+            cache_stats["assess_hits"] += 1
+            logger.debug("[LeadExtract] assess cache HIT")
+            return _assess_cache[key]
         try:
             raw = await llm.generate(
                 prompt,
@@ -835,6 +988,7 @@ def _build_react_tools(
                 temperature=0.1,
                 response_format={"type": "json_object"},
             )
+            _assess_cache[key] = raw
             return raw
         except Exception as e:
             return json.dumps({"error": f"LLM assessment failed: {e}", "match_score": 0.3})

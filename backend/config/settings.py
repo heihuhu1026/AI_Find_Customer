@@ -100,6 +100,20 @@ class Settings(BaseSettings):
     reasoning_max_tokens: int = 4096
     reasoning_requests_per_minute: int = 0
 
+    # --- Model fallback chains (百炼多模型额度轮换) ---
+    # 主模型额度耗尽/限流/不可用时，自动切到列表中的下一个模型继续。
+    # 逗号分隔；模型名可带 dashscope/ 前缀或裸名（裸名自动补 dashscope/）。
+    # 本地兜底请写全名，例如 ollama/qwen2.5:7b-instruct-q4_K_M（放最后）。
+    llm_model_fallback: str = ""
+    reasoning_model_fallback: str = ""
+    email_llm_model_fallback: str = ""
+    email_reasoning_model_fallback: str = ""
+
+    # --- Local model endpoint (Ollama) ---
+    # 本地模型作为云端额度全耗尽时的最后兜底，无需 API Key。
+    ollama_api_base: str = "http://127.0.0.1:11434"
+    ollama_request_timeout: int = 300
+
     # --- LLM Provider API Keys ---
     openai_api_key: str = ""
     anthropic_api_key: str = ""
@@ -109,6 +123,9 @@ class Settings(BaseSettings):
     moonshot_api_key: str = ""    # Kimi / Moonshot AI
     minimax_api_key: str = ""
     minimax_api_base: str = "https://api.minimax.io/v1"
+    dashscope_api_key: str = ""   # 阿里云百炼 (DashScope / Qwen)
+    deepseek_api_key: str = ""    # DeepSeek 官方
+    volcengine_api_key: str = ""  # 火山方舟 (豆包)
     email_openai_api_key: str = ""
     email_anthropic_api_key: str = ""
     email_openrouter_api_key: str = ""
@@ -116,11 +133,24 @@ class Settings(BaseSettings):
     email_zai_api_key: str = ""
     email_moonshot_api_key: str = ""
     email_minimax_api_key: str = ""
+    email_dashscope_api_key: str = ""
+    email_deepseek_api_key: str = ""
+    email_volcengine_api_key: str = ""
 
     # --- Search ---
     serper_api_key: str = ""
     tavily_api_key: str = ""      # supports multiple keys: "key1,key2"
+    brave_api_key: str = ""       # Brave Search API (free tier: 2,000 queries/month)
     jina_api_key: str = ""
+    # Ordered search-backend preference (subset of brave/tavily/serper).
+    # First reachable backend wins. In networks that block some providers
+    # (e.g. corporate proxies), put the reachable one first to skip retries.
+    search_backend_order: str = "brave,tavily,serper"
+    # When a backend is unreachable, fail fast instead of long backoff.
+    search_backend_retry_attempts: int = 2
+    search_backend_timeout: float = 12.0
+    # Jina Reader page fetch: 0 disables network fetch (uses search snippet only).
+    jina_reader_enabled: bool = True
 
     # --- Email ---
     email_provider_type: str = "smtp"
@@ -189,7 +219,7 @@ class Settings(BaseSettings):
     search_concurrency: int = 10  # max concurrent Serper API calls
     scrape_concurrency: int = 5   # max concurrent Jina Reader calls
     email_gen_concurrency: int = 3  # max concurrent LLM calls for email generation
-    react_max_iterations: int = 5   # max ReAct loop iterations per URL
+    react_max_iterations: int = 3   # max ReAct loop iterations per URL (token optimization: 5->3)
 
     # --- API ---
     api_host: str = "0.0.0.0"
@@ -235,3 +265,15 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Return cached settings singleton."""
     return Settings()
+
+
+def reload_settings() -> Settings:
+    """Drop the cached singleton and re-read .env.
+
+    Needed so that saving settings (or editing .env) takes effect in the
+    already-running server process without a full restart. pydantic-settings
+    only reads the env file once per process; get_settings() is @lru_cache'd
+    on top of that, so callers must explicitly clear it after a change.
+    """
+    get_settings.cache_clear()
+    return get_settings()

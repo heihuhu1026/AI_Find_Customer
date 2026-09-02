@@ -94,27 +94,58 @@ const PROVIDERS: Provider[] = [
   },
   {
     id: "glm",
-    label: "GLM / Z.AI",
+    label: "GLM / 智谱 Z.AI",
     apiKeyField: "zai_api_key",
     apiKeyPlaceholder: "",
-    defaultModels: ["openai/glm-4-flash", "openai/glm-4-air"],
-    reasoningModels: ["openai/glm-4", "openai/glm-z1-airx"],
+    defaultModels: ["zai/glm-4.6", "zai/glm-4.5-air", "zai/glm-4.7-flash"],
+    reasoningModels: ["zai/glm-4.7", "zai/glm-5.1"],
   },
   {
     id: "kimi",
     label: "Kimi (Moonshot)",
     apiKeyField: "moonshot_api_key",
     apiKeyPlaceholder: "",
-    defaultModels: ["openai/moonshot-v1-8k", "openai/moonshot-v1-32k"],
-    reasoningModels: ["openai/moonshot-v1-128k", "openai/kimi-k1-5"],
+    defaultModels: ["moonshot/kimi-latest-8k", "moonshot/kimi-latest-32k"],
+    reasoningModels: ["moonshot/kimi-k2-thinking", "moonshot/kimi-latest-128k"],
   },
   {
     id: "minimax",
     label: "MiniMax",
     apiKeyField: "minimax_api_key",
     apiKeyPlaceholder: "",
-    defaultModels: ["openai/MiniMax-Text-01"],
-    reasoningModels: ["openai/MiniMax-Text-01"],
+    defaultModels: ["minimax/MiniMax-Text-01"],
+    reasoningModels: ["minimax/MiniMax-Text-01"],
+  },
+  {
+    id: "dashscope",
+    label: "阿里云百炼 (DashScope / 通义千问)",
+    apiKeyField: "dashscope_api_key",
+    apiKeyPlaceholder: "sk-…",
+    defaultModels: [
+      "dashscope/qwen-turbo",
+      "dashscope/qwen-plus",
+      "dashscope/qwen-plus-latest",
+    ],
+    reasoningModels: ["dashscope/qwen-max", "dashscope/qwen-plus"],
+  },
+  {
+    id: "deepseek",
+    label: "DeepSeek 官方",
+    apiKeyField: "deepseek_api_key",
+    apiKeyPlaceholder: "sk-…",
+    defaultModels: ["deepseek/deepseek-chat"],
+    reasoningModels: ["deepseek/deepseek-reasoner"],
+  },
+  {
+    id: "volcengine",
+    label: "火山方舟 (豆包)",
+    apiKeyField: "volcengine_api_key",
+    apiKeyPlaceholder: "",
+    defaultModels: [
+      "volcengine/doubao-seed-2-0-lite-260215",
+      "volcengine/doubao-seed-2-0-pro-260215",
+    ],
+    reasoningModels: ["volcengine/doubao-seed-2-0-pro-260215"],
   },
 ];
 
@@ -126,6 +157,9 @@ const MAIN_API_KEY_FIELDS: Record<string, string> = {
   glm: "zai_api_key",
   kimi: "moonshot_api_key",
   minimax: "minimax_api_key",
+  dashscope: "dashscope_api_key",
+  deepseek: "deepseek_api_key",
+  volcengine: "volcengine_api_key",
 };
 
 const EMAIL_API_KEY_FIELDS: Record<string, string> = {
@@ -136,6 +170,9 @@ const EMAIL_API_KEY_FIELDS: Record<string, string> = {
   glm: "email_zai_api_key",
   kimi: "email_moonshot_api_key",
   minimax: "email_minimax_api_key",
+  dashscope: "email_dashscope_api_key",
+  deepseek: "email_deepseek_api_key",
+  volcengine: "email_volcengine_api_key",
 };
 
 // ── Helpers to detect provider from a model string ───────────────────────────
@@ -145,7 +182,15 @@ function detectProvider(model: string): string {
   if (model.startsWith("anthropic/")) return "anthropic";
   if (model.startsWith("openrouter/")) return "openrouter";
   if (model.startsWith("groq/")) return "groq";
-  if (model.startsWith("openai/glm") || model.startsWith("openai/glm")) return "glm";
+  // 原生 provider 前缀（当前推荐写法）
+  if (model.startsWith("dashscope/")) return "dashscope";
+  if (model.startsWith("deepseek/")) return "deepseek";
+  if (model.startsWith("volcengine/")) return "volcengine";
+  if (model.startsWith("zai/")) return "glm";
+  if (model.startsWith("moonshot/")) return "kimi";
+  if (model.startsWith("minimax/")) return "minimax";
+  // 兼容旧配置：早期用 openai/ 前缀指向国内厂商
+  if (model.startsWith("openai/glm")) return "glm";
   if (model.startsWith("openai/moonshot") || model.startsWith("openai/kimi")) return "kimi";
   if (model.startsWith("openai/MiniMax")) return "minimax";
   return "openai";
@@ -1160,6 +1205,9 @@ export function SettingsPage() {
         ZAI_API_KEY: "zai_api_key",
         MOONSHOT_API_KEY: "moonshot_api_key",
         MINIMAX_API_KEY: "minimax_api_key",
+        DASHSCOPE_API_KEY: "dashscope_api_key",
+        DEEPSEEK_API_KEY: "deepseek_api_key",
+        VOLCENGINE_API_KEY: "volcengine_api_key",
         EMAIL_OPENAI_API_KEY: "email_openai_api_key",
         EMAIL_ANTHROPIC_API_KEY: "email_anthropic_api_key",
         EMAIL_OPENROUTER_API_KEY: "email_openrouter_api_key",
@@ -1167,6 +1215,9 @@ export function SettingsPage() {
         EMAIL_ZAI_API_KEY: "email_zai_api_key",
         EMAIL_MOONSHOT_API_KEY: "email_moonshot_api_key",
         EMAIL_MINIMAX_API_KEY: "email_minimax_api_key",
+        EMAIL_DASHSCOPE_API_KEY: "email_dashscope_api_key",
+        EMAIL_DEEPSEEK_API_KEY: "email_deepseek_api_key",
+        EMAIL_VOLCENGINE_API_KEY: "email_volcengine_api_key",
         SERPER_API_KEY: "serper_api_key",
         TAVILY_API_KEY: "tavily_api_key",
         JINA_API_KEY: "jina_api_key",

@@ -22,7 +22,12 @@ import litellm
 
 from config.settings import Settings, get_settings
 from tools.llm_errors import format_llm_error
-from tools.llm_client import _inject_api_keys, normalize_model_name
+from tools.llm_client import (
+    _inject_api_keys,
+    normalize_model_name,
+    _is_switchable_error,
+    _prefix_model,
+)
 from tools.llm_rate_limiter import get_llm_rate_limiter
 
 logger = logging.getLogger(__name__)
@@ -31,7 +36,54 @@ logger = logging.getLogger(__name__)
 _MAX_JSON_NUDGES = 2
 
 # Max messages allowed before trimming to prevent token overflow
-_MAX_MESSAGES_BEFORE_TRIM = 30
+_MAX_MESSAGES_BEFORE_TRIM = 20
+
+# 2.3: cap individual tool results stored in history so search/snippet results
+# are not re-sent (in full) on every ReAct iteration.
+_MAX_TOOL_RESULT_CHARS = 4000
+
+
+class _ModelSwitch(Exception):
+    """Raised when the current reasoning model is exhausted/unavailable and the
+    ReAct loop should retry with the next model in the fallback chain."""
+
+
+def _reasoning_chain(settings: Settings) -> list[str]:
+    """Ordered reasoning-model fallback chain: primary + configured fallbacks.
+
+    Mirrors ``LLMTool._model_chain`` so the ReAct agent also survives a single
+    model's quota/rate-limit exhaustion by transparently switching models.
+    """
+    primary = normalize_model_name(settings.reasoning_model)
+    fb_env = settings.reasoning_model_fallback or settings.llm_model_fallback
+    raw = [m.strip() for m in (fb_env or "").split(",") if m.strip()]
+    chain = [primary] + [_prefix_model(m) for m in raw]
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in chain:
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
+async def _completion(settings: Settings, *, scope: str = "reasoning", **kwargs: Any) -> Any:
+    """Thin wrapper that raises :class:`_ModelSwitch` on a switchable
+    (quota/rate-limit/403) error so ``react_loop`` can fall back to the next
+    model instead of aborting the whole request.
+
+    The target model is already inside ``kwargs['model']`` (set by the
+    caller). Passing it again positionally would make litellm receive the
+    argument twice, so we only forward ``**kwargs`` here.
+    """
+    try:
+        return await _acompletion_with_rpm_limit(settings, scope=scope, **kwargs)
+    except _ModelSwitch:
+        raise
+    except Exception as e:  # noqa: BLE001
+        if _is_switchable_error(e):
+            raise _ModelSwitch(str(e)) from e
+        raise
 
 
 async def _acompletion_with_rpm_limit(
@@ -108,7 +160,7 @@ def _has_required_fields(parsed: dict | list | None, required_fields: list[str])
     return all(field in parsed for field in required_fields)
 
 
-def _trim_messages(messages: list[dict[str, Any]], keep_last: int = 10) -> list[dict[str, Any]]:
+def _trim_messages(messages: list[dict[str, Any]], keep_last: int = 6) -> list[dict[str, Any]]:
     """Trim messages to prevent token overflow.
 
     Keeps: system message (first) + initial user message (second) + last N messages.
@@ -231,15 +283,47 @@ async def react_loop(
     """
     _settings = settings or get_settings()
     max_iter = max_iterations or _settings.react_max_iterations
-    if model_scope == "email_reasoning":
-        model = normalize_model_name(_settings.email_reasoning_model or _settings.reasoning_model)
-    else:
-        model = normalize_model_name(_settings.reasoning_model)
     temperature = _settings.reasoning_temperature
     max_tokens = _settings.reasoning_max_tokens
 
     # Inject API keys
     _inject_api_keys(_settings, model_scope)
+
+    # Try each model in the fallback chain; switch on quota/rate-limit errors.
+    chain = _reasoning_chain(_settings)
+    last_exc: Exception | None = None
+    for model in chain:
+        try:
+            return await _react_run_once(
+                _settings, model, model_scope, max_iter, temperature, max_tokens,
+                system, user_prompt, tools, [t.to_openai_schema() for t in tools],
+                required_json_fields, hunt_id, agent, hunt_round,
+            )
+        except _ModelSwitch as e:
+            last_exc = e
+            logger.warning(
+                "[ReAct] model %s exhausted/unavailable; trying next in chain", model
+            )
+            continue
+    raise RuntimeError(format_llm_error(last_exc) or "All reasoning models failed")
+
+
+async def _react_run_once(
+    _settings: Settings,
+    model: str,
+    model_scope: str,
+    max_iter: int,
+    temperature: float,
+    max_tokens: int,
+    system: str,
+    user_prompt: str,
+    tools: list[ToolDef],
+    tool_schemas: list[dict],
+    required_json_fields: list[str] | None,
+    hunt_id: str,
+    agent: str,
+    hunt_round: int,
+) -> str:
 
     # Build tool schemas and lookup
     tool_schemas = [t.to_openai_schema() for t in tools]
@@ -277,8 +361,12 @@ async def react_loop(
             })
 
         try:
-            response = await _acompletion_with_rpm_limit(_settings, scope=model_scope, **kwargs)
+            response = await _completion(_settings, scope=model_scope, **kwargs)
             _record_react_cost(response, hunt_id, agent, model, hunt_round)
+        except _ModelSwitch:
+            # Current reasoning model exhausted/unavailable → let react_loop
+            # transparently switch to the next model in the fallback chain.
+            raise
         except Exception as e:
             # Fallback for last iteration: some Anthropic-compatible APIs (e.g. MiniMax)
             # reject tool_choice="none" or tools= when history has tool_call messages.
@@ -294,8 +382,10 @@ async def react_loop(
                         "temperature": temperature,
                         "max_tokens": max_tokens,
                     }
-                    response = await _acompletion_with_rpm_limit(_settings, scope=model_scope, **fallback_kwargs)
+                    response = await _completion(_settings, scope=model_scope, **fallback_kwargs)
                     _record_react_cost(response, hunt_id, agent, model, hunt_round)
+                except _ModelSwitch:
+                    raise
                 except Exception as e2:
                     formatted = format_llm_error(e2)
                     logger.error("[ReAct] Fallback call also failed at iteration %d: %s", iteration, formatted)
@@ -348,9 +438,8 @@ async def react_loop(
             # Use a dedicated nudge sub-loop to avoid consuming main iterations
             for nudge in range(_MAX_JSON_NUDGES):
                 try:
-                    nudge_resp = await _acompletion_with_rpm_limit(
-                        _settings,
-                        scope=model_scope,
+                    nudge_resp = await _completion(
+                        _settings, scope=model_scope,
                         model=model,
                         messages=nudge_messages,
                         temperature=temperature,
@@ -371,6 +460,9 @@ async def react_loop(
                         "content": "That is still not valid JSON. Output ONLY a raw JSON object starting with '{'. Nothing else.",
                     })
                     nudge_messages = _trim_messages(nudge_messages)
+                except _ModelSwitch:
+                    # Reasoning model exhausted mid-nudge → bail to next model.
+                    raise
                 except Exception as e:
                     logger.warning("[ReAct] Nudge call failed: %s", format_llm_error(e))
                     break
@@ -402,10 +494,13 @@ async def react_loop(
                     logger.warning("[ReAct] Tool %s failed: %s", fn_name, e)
                     result = json.dumps({"error": f"Tool {fn_name} failed: {e}"})
 
+            tool_content = result
+            if len(tool_content) > _MAX_TOOL_RESULT_CHARS:
+                tool_content = tool_content[:_MAX_TOOL_RESULT_CHARS] + "\n...[tool result truncated]"
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
-                "content": result,
+                "content": tool_content,
             })
 
     # Exhausted iterations — ask for final answer without tools
@@ -420,9 +515,8 @@ async def react_loop(
 
     for attempt in range(_MAX_JSON_NUDGES + 1):
         try:
-            response = await _acompletion_with_rpm_limit(
-                _settings,
-                scope=model_scope,
+            response = await _completion(
+                _settings, scope=model_scope,
                 model=model,
                 messages=final_messages,
                 temperature=temperature,
@@ -442,6 +536,9 @@ async def react_loop(
                     "content": "That is not valid JSON. Output ONLY a raw JSON object starting with '{'. Nothing else.",
                 })
                 final_messages = _trim_messages(final_messages)
+        except _ModelSwitch:
+            # Reasoning model exhausted during final-answer phase → bail to next model.
+            raise
         except Exception as e:
             formatted = format_llm_error(e)
             logger.error("[ReAct] Final answer call failed: %s", formatted)

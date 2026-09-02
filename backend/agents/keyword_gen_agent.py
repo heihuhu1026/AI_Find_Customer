@@ -166,12 +166,15 @@ def _build_prompt(state: HuntState) -> str:
         # Full per-keyword performance table
         kw_perf = feedback.get("keyword_performance", [])
         if kw_perf:
+            # 3.1: only the top 10 keywords by leads_found — unbounded growth
+            # bloats the prompt across rounds.
+            top = sorted(kw_perf, key=lambda k: k.get("leads_found", 0), reverse=True)[:10]
             perf_lines = [
-                "### Per-Keyword Performance",
+                "### Per-Keyword Performance (top 10 by leads found)",
                 "| Keyword | Search Results | Leads Found | Effectiveness |",
                 "|---------|---------------|-------------|---------------|",
             ]
-            for kp in kw_perf:
+            for kp in top:
                 perf_lines.append(
                     f"| {kp.get('keyword', '')} | {kp.get('search_results', 0)} | "
                     f"{kp.get('leads_found', 0)} | {kp.get('effectiveness', 'unknown')} |"
@@ -271,12 +274,55 @@ async def keyword_gen_node(state: HuntState) -> dict:
         else:
             keywords = []
 
-        # Ensure strings and deduplicate against used
+        # Ensure strings, then deduplicate against already-used keywords
         used = set(kw.lower() for kw in state.get("used_keywords", []))
-        keywords = [
-            kw for kw in keywords
-            if isinstance(kw, str) and kw.lower() not in used
-        ][:n_keywords]
+        keywords = [kw for kw in keywords if isinstance(kw, str)]
+        fresh = [kw for kw in keywords if kw.lower() not in used]
+
+        if not fresh and keywords:
+            # Every generated keyword was already tried. Retry once with an
+            # explicit avoidance list instead of wasting the round on 0 keywords
+            # (which would make SearchAgent skip discovery entirely).
+            logger.info(
+                "[KeywordGenAgent] All %d generated keywords already used; retrying with avoidance hint",
+                len(keywords),
+            )
+            avoid = "\n".join(f"- {k}" for k in sorted(used)[:50])
+            try:
+                raw = await llm.generate(
+                    prompt
+                    + "\n\nIMPORTANT: Do NOT repeat any of these already-tried keywords. "
+                    "Think of different angles: other synonyms, adjacent product lines, "
+                    "different cities/states, and different buyer intents:\n"
+                    + avoid,
+                    system=system,
+                    temperature=0.9,
+                    response_format={"type": "json_object"},
+                )
+                parsed = parse_json(raw, context="KeywordGenAgent-retry")
+            except Exception as retry_exc:
+                logger.warning("[KeywordGenAgent] Retry failed: %s", retry_exc)
+                parsed = None
+
+            if isinstance(parsed, list):
+                retry_kws = parsed
+            elif isinstance(parsed, dict):
+                retry_kws = parsed.get("keywords", [])
+            else:
+                retry_kws = []
+            retry_kws = [kw for kw in retry_kws if isinstance(kw, str) and kw.lower() not in used]
+
+            if retry_kws:
+                fresh = retry_kws
+            else:
+                # Last resort: reuse unfiltered output rather than skip the round entirely.
+                logger.warning(
+                    "[KeywordGenAgent] Retry produced no new keywords; reusing %d unfiltered ones",
+                    len(keywords),
+                )
+                fresh = keywords
+
+        keywords = fresh[:n_keywords]
 
     except Exception as e:
         logger.error("KeywordGenAgent failed: %s", e)
