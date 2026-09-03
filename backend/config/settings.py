@@ -137,6 +137,18 @@ class Settings(BaseSettings):
     email_deepseek_api_key: str = ""
     email_volcengine_api_key: str = ""
 
+    # --- Tencent Hunyuan (TokenHub) — OpenAI-compatible endpoint ---
+    # 腾讯混元大模型官方 API（TokenHub），OpenAI 兼容格式。
+    # 用法：把 LLM_MODEL / REASONING_MODEL 设为虚拟前缀 "tencent/<model>"，
+    # 例如 tencent/hy3。LLM 客户端会自动改写为 OpenAI 兼容调用并附带 base/key。
+    # 申请/领取免费额度：腾讯云 TokenHub 控制台
+    #   https://console.cloud.tencent.com/tokenhub/
+    # 新用户可领 100 万 Tokens 免费体验包（90 天有效）。
+    # 注意：该通道仅在使用 tencent/ 前缀时生效；其它 provider 不受影响。
+    tencent_api_key: str = ""
+    tencent_api_base: str = "https://tokenhub.tencentmaas.com/v1"
+    tencent_reasoning_effort: str = "low"  # Hy3 思考深度：no_think / low / high
+
     # --- Search ---
     serper_api_key: str = ""
     tavily_api_key: str = ""      # supports multiple keys: "key1,key2"

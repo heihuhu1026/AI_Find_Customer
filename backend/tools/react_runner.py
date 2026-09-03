@@ -22,7 +22,7 @@ import litellm
 
 from config.settings import Settings, get_settings
 from tools.llm_errors import format_llm_error
-from tools.llm_client import _inject_api_keys, normalize_model_name
+from tools.llm_client import _inject_api_keys, normalize_model_name, apply_tencent_transport
 from tools.llm_rate_limiter import get_llm_rate_limiter
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,9 @@ async def _acompletion_with_rpm_limit(
         rpm = settings.email_reasoning_requests_per_minute or settings.reasoning_requests_per_minute or settings.llm_requests_per_minute
     else:
         rpm = settings.reasoning_requests_per_minute or settings.llm_requests_per_minute
+    # Tencent Hunyuan (TokenHub) virtual provider → OpenAI-compatible transport.
+    # Rewrites "tencent/<model>" so the ReAct reasoning loop can use Hy3 too.
+    apply_tencent_transport(settings, kwargs.get("model", ""), kwargs)
     await get_llm_rate_limiter(scope, rpm).acquire()
     return await litellm.acompletion(**kwargs)
 

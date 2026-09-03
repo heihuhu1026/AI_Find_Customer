@@ -79,6 +79,24 @@ async def test_connection():
         if success:
             print(f"\n    >>> WORKING CONFIG: {label} <<<")
 
+    # 2. Tencent Hunyuan (TokenHub) test — uses the app's unified LLMTool so the
+    #    exact same configuration the server uses is exercised end-to-end.
+    print(f"\n[2] Tencent Hunyuan (TokenHub) test:")
+    if settings.tencent_api_key:
+        try:
+            from config.settings import Settings
+            from tools.llm_client import LLMTool
+            ten_settings = Settings(**{**settings.model_dump(), "llm_model": "tencent/hy3"})
+            tool = LLMTool(settings=ten_settings)
+            resp = await tool.generate("Reply with exactly: TENCENT OK", max_tokens=20, temperature=0.1)
+            print(f"    SUCCESS! Response: {resp.strip()}")
+            results.append(True)
+        except Exception as e:
+            print(f"    FAILED: {type(e).__name__}: {str(e)[:300]}")
+            results.append(False)
+    else:
+        print("    Skipped — TENCENT_API_KEY not set. Add it to .env to enable this test.")
+
     print("\n" + "="*50)
     if any(results):
         print(" AT LEAST ONE CONNECTION WAS SUCCESSFUL.")
