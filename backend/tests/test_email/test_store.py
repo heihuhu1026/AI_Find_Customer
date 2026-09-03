@@ -10,7 +10,7 @@ def test_email_store_init_and_account_roundtrip(tmp_path: Path):
     store.upsert_account({
         "id": "acct_1",
         "provider_type": "smtp",
-        "from_name": "B2Binsights",
+        "from_name": "AI Hunter",
         "from_email": "sales@example.com",
         "reply_to": "sales@example.com",
         "smtp_host": "smtp.example.com",

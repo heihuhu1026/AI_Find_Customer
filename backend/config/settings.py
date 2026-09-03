@@ -124,7 +124,7 @@ class Settings(BaseSettings):
 
     # --- Email ---
     email_provider_type: str = "smtp"
-    email_from_name: str = "B2Binsights"
+    email_from_name: str = "AI Hunter"
     email_from_address: str = ""
     email_reply_to: str = ""
     email_smtp_host: str = ""

@@ -7,27 +7,11 @@
 [![React](https://img.shields.io/badge/React-18-blue)](https://react.dev)
 [![LangGraph](https://img.shields.io/badge/LangGraph-StateGraph-orange)](https://github.com/langchain-ai/langgraph)
 
-AI Hunter 是一个面向外贸与 B2B 线索挖掘场景的开源版项目。你只需要提供公司官网、产品文档或产品关键词，再指定目标市场，系统就会自动完成公司理解、关键词生成、网页搜索、线索提取和联系方式发现。
+AI Hunter 是一个面向外贸与 B2B 线索挖掘场景的自动化客户挖掘系统。你只需要提供公司官网、产品文档或产品关键词，再指定目标市场，系统就会自动完成公司理解、关键词生成、网页搜索、线索提取和联系方式发现。
 
-## 官方链接
+## 项目说明
 
-- 官网：https://b2binsights.io/
-- 视频介绍：https://www.bilibili.com/video/BV1AzwYzXEGD/?spm_id_from=333.1387.list.card_archive.click
-- 开源仓库：https://github.com/xiongQvQ/AI_Find_Customer
-
-## 不想自己折腾？试试 B2Binsights
-
-这个开源项目适合愿意折腾的技术型用户。如果你只是想**拿到一份能打电话、能写邮件的客户名单**，不想折腾部署和配置，可以看看 [B2Binsights](https://b2binsights.pages.dev/)——我们把它做成了开箱即用的产品：
-
-- **部署在你电脑上**，API Key 是你自己的，客户数据从头到尾不经过我们
-- **你描述目标客户**（什么行业、哪几个国家、找谁），我们帮你配置好，跑出第一批线索
-- **拿到的是决策人联系方式**：姓名、职位、邮箱、LinkedIn、证据来源链接——不是一堆公司名
-- **每条线索附证据**，你可以点开链接自己验证
-- **一次性收费**，不是 SaaS 订阅
-
-开源版已经覆盖了主线能力，B2Binsights 在此基础上加了竞品渠道分析、展会名单清洗、CRM 对接、开发信生成、飞书/企微入口等定制模块。
-
-> 拿不准适不适合？加微信 **XiongX0110**，说一下你的行业和目标客户，免费帮你跑一批线索样本先看质量。
+本仓库为本地部署版本，仅供本机自用，不依赖任何外部商业服务。
 
 ## 开源仓库范围
 
@@ -244,7 +228,7 @@ AI_Find_Customer/
 ### 1. 克隆仓库
 
 ```bash
-git clone https://github.com/xiongQvQ/AI_Find_Customer.git
+git clone <你的仓库地址>
 cd AI_Find_Customer
 ```
 
@@ -704,9 +688,9 @@ EMAIL_REQUIRE_APPROVAL_BEFORE_SEND=false
 
 仓库已经提供 systemd 示例文件：
 
-- [deploy/systemd/ai-hunter-api.service](/Users/xiongbojian/work/opensource/AI_Find_Customer/deploy/systemd/ai-hunter-api.service)
-- [deploy/systemd/ai-hunter-producer.service](/Users/xiongbojian/work/opensource/AI_Find_Customer/deploy/systemd/ai-hunter-producer.service)
-- [deploy/systemd/ai-hunter-worker.service](/Users/xiongbojian/work/opensource/AI_Find_Customer/deploy/systemd/ai-hunter-worker.service)
+- [deploy/systemd/ai-hunter-api.service](deploy/systemd/ai-hunter-api.service)
+- [deploy/systemd/ai-hunter-producer.service](deploy/systemd/ai-hunter-producer.service)
+- [deploy/systemd/ai-hunter-worker.service](deploy/systemd/ai-hunter-worker.service)
 
 推荐：
 
@@ -977,25 +961,9 @@ bun run build
 - 根据产品资料自动反推目标客户画像与搜索词
 - 针对特定国家或区域进行批量线索挖掘
 
-## 联系作者
+## 说明
 
-如有问题、建议或定制需求，欢迎添加微信交流：
-
-<div align="center">
-  <img src="wechat-qr.jpeg" alt="微信二维码" width="200" />
-  <p><strong>微信号</strong></p>
-</div>
-
----
-
-## 赞赏
-
-如果这个项目对你有帮助，欢迎请作者喝杯咖啡 ☕
-
-<div align="center">
-  <img src="payment-qr.jpeg" alt="收款码" width="200" />
-  <p><strong>收款码</strong></p>
-</div>
+本仓库仅用于本机本地部署与自用。
 
 ---
 

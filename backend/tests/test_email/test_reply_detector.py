@@ -11,7 +11,7 @@ def _seed_store(store: EmailStore) -> None:
     store.upsert_account({
         "id": "default",
         "provider_type": "smtp",
-        "from_name": "B2Binsights",
+        "from_name": "AI Hunter",
         "from_email": "sales@example.com",
         "reply_to": "sales@example.com",
         "smtp_host": "smtp.example.com",

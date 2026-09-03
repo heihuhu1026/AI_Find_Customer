@@ -16,7 +16,7 @@ async def test_send_email_missing_recipient():
 async def test_send_email_smtp_success():
     account = {
         "provider_type": "smtp",
-        "from_name": "B2Binsights",
+        "from_name": "AI Hunter",
         "from_email": "sales@example.com",
         "reply_to": "sales@example.com",
         "smtp_host": "smtp.example.com",
@@ -39,7 +39,7 @@ async def test_send_email_smtp_success():
 async def test_send_email_formats_plaintext_body_before_sending():
     account = {
         "provider_type": "smtp",
-        "from_name": "B2Binsights",
+        "from_name": "AI Hunter",
         "from_email": "sales@example.com",
         "reply_to": "sales@example.com",
         "smtp_host": "smtp.example.com",
