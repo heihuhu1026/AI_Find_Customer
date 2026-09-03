@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import Enum
 
 from pydantic import BaseModel, Field
@@ -94,3 +95,59 @@ class RoundFeedback(BaseModel):
     top_sources: list[str] = Field(default_factory=list)
     industry_distribution: dict[str, int] = Field(default_factory=dict)
     region_distribution: dict[str, int] = Field(default_factory=dict)
+
+
+# ── Business-optimization models (customer portraits / blacklist / social) ──
+
+
+class Blacklist(BaseModel):
+    """A blacklist entry (domain or keyword) excluded from future hunts."""
+
+    id: str
+    type: Literal["domain", "keyword"] = "keyword"
+    value: str
+    note: str = ""
+    created_at: str = ""
+
+
+class ICPProfile(BaseModel):
+    """Ideal-customer-profile distilled from source customers' insights."""
+
+    industries: list[str] = Field(default_factory=list)
+    employee_range: list[str] = Field(default_factory=list)
+    regions: list[str] = Field(default_factory=list)
+    keywords: list[str] = Field(default_factory=list)
+    tech_stack: list[str] = Field(default_factory=list)
+
+
+class CustomerPortrait(BaseModel):
+    """A reusable customer portrait (IC + provenance) built from source domains."""
+
+    id: str
+    name: str
+    source_customers: list[str] = Field(default_factory=list)
+    icp: ICPProfile = Field(default_factory=ICPProfile)
+    insight_summary: str = ""
+    created_at: str = ""
+    hunt_count: int = 0
+    total_leads: int = 0
+
+
+class SocialData(BaseModel):
+    """Enriched contact/social data attached to a lead (Apollo etc.)."""
+
+    linkedin_url: str = ""
+    job_title: str = ""
+    department: str = ""
+    summary: str = ""
+    source: str = ""
+    enriched_at: str = ""
+
+
+class LeadFilterMeta(BaseModel):
+    """Metadata describing why/how a lead passed a hunt's filter rules."""
+
+    source_type: str = ""
+    data_sources: list[str] = Field(default_factory=list)
+    filtered: bool = False
+    filter_reason: str = ""

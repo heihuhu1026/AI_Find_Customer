@@ -267,6 +267,11 @@ class Settings(BaseSettings):
     upload_dir: str = _resolve_dir("uploads")
     max_upload_size_mb: int = 50
 
+    # --- Social enrichment (Apollo etc.) ---
+    social_api_provider: str = "apollo"
+    social_api_key: str = ""
+    social_api_timeout: int = 15
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from pathlib import Path
@@ -31,6 +32,14 @@ from emailing.smtp_client import send_smtp_email
 from api.hunt_store import load_all_hunts, save_hunt, now_iso
 from api.security import require_api_access
 from api.errors import safe_error_detail
+from utils.storage import (
+    get_blacklists, save_blacklist, delete_blacklist,
+    get_portraits, save_portrait, delete_portrait, get_portrait_by_id,
+    get_leads, find_lead, update_lead, make_lead_key,
+)
+from services.portrait_service import PortraitService
+from services.portrait_builder import build_portrait, start_hunt_from_portrait
+from tools.social_enrich import SocialEnricher
 from graph.builder import build_graph
 from graph.evaluate import evaluate_progress, should_continue_hunting, _build_keyword_performance
 from observability.cost_tracker import get_tracker, remove_tracker
@@ -132,6 +141,10 @@ class HuntRequest(BaseModel):
     email_template_examples: list[str] = Field(default_factory=list, description="Optional historical outreach emails or template samples from the user")
     email_template_notes: str = Field(default="", description="Optional notes about preferred style, offer, or constraints")
     template_seed: dict[str, Any] | None = None
+    mode: str = Field(default="forward", description="'forward' | 'reverse' | 'hybrid'")
+    competitors: list[str] = Field(default_factory=list)
+    reverse_templates: list[str] = Field(default_factory=list)
+    filters: dict[str, Any] | None = None
 
 
 class ResumeRequest(BaseModel):
@@ -601,6 +614,11 @@ async def _run_hunt(hunt_id: str, request: HuntRequest) -> None:
         "email_template_examples": list(request.email_template_examples),
         "email_template_notes": request.email_template_notes,
         "template_seed": request.template_seed or None,
+        "mode": request.mode,
+        "competitors": list(request.competitors),
+        "reverse_templates": list(request.reverse_templates),
+        "filters": request.filters,
+        "filter_stats": {},
         "insight": None,
         "keywords": [],
         "used_keywords": [],
@@ -1389,6 +1407,147 @@ async def list_hunts():
     # Sort by created_at descending (newest first)
     items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     return items
+
+
+# ── Business-optimization request bodies ────────────────────────────────
+class BlacklistCreate(BaseModel):
+    type: Literal["domain", "keyword"] = "keyword"
+    value: str
+    note: str = ""
+
+
+class PortraitCreate(BaseModel):
+    name: str
+    source_customers: list[str] = Field(default_factory=list)
+    insight_summary: str = ""
+
+
+# ── Blacklists (C3) ─────────────────────────────────────────────────────
+@router.get("/blacklists", dependencies=[Depends(require_api_access)])
+async def list_blacklists():
+    """List all blacklist entries."""
+    return {"items": get_blacklists()}
+
+
+@router.post("/blacklists", dependencies=[Depends(require_api_access)])
+async def add_blacklist(payload: BlacklistCreate):
+    """Add a single blacklist entry (domain or keyword)."""
+    item = {
+        "id": uuid.uuid4().hex,
+        "type": payload.type,
+        "value": payload.value,
+        "note": payload.note,
+        "created_at": now_iso(),
+    }
+    if not save_blacklist(item):
+        raise HTTPException(status_code=500, detail="failed to save blacklist")
+    return item
+
+
+@router.post("/blacklists/batch", dependencies=[Depends(require_api_access)])
+async def add_blacklists_batch(payload: list[BlacklistCreate]):
+    """Add multiple blacklist entries at once."""
+    saved: list[dict] = []
+    for p in payload:
+        item = {
+            "id": uuid.uuid4().hex,
+            "type": p.type,
+            "value": p.value,
+            "note": p.note,
+            "created_at": now_iso(),
+        }
+        if save_blacklist(item):
+            saved.append(item)
+    return {"saved": len(saved), "items": saved}
+
+
+@router.delete("/blacklists/{item_id}", dependencies=[Depends(require_api_access)])
+async def remove_blacklist(item_id: str):
+    """Remove a blacklist entry by id."""
+    if not delete_blacklist(item_id):
+        raise HTTPException(status_code=404, detail="blacklist not found")
+    return {"deleted": item_id}
+
+
+# ── Portraits (C4) ──────────────────────────────────────────────────────
+@router.get("/portraits", dependencies=[Depends(require_api_access)])
+async def list_portraits():
+    """List all customer portraits."""
+    return {"items": get_portraits()}
+
+
+@router.post("/portraits", dependencies=[Depends(require_api_access)])
+async def add_portrait(payload: PortraitCreate):
+    """Create a portrait manually (no LLM)."""
+    svc = PortraitService()
+    return svc.create_portrait(
+        name=payload.name,
+        source_customers=payload.source_customers,
+        insight_summary=payload.insight_summary,
+    )
+
+
+@router.get("/portraits/{portrait_id}", dependencies=[Depends(require_api_access)])
+async def get_portrait(portrait_id: str):
+    """Get one portrait by id."""
+    item = get_portrait_by_id(portrait_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="portrait not found")
+    return item
+
+
+@router.delete("/portraits/{portrait_id}", dependencies=[Depends(require_api_access)])
+async def remove_portrait(portrait_id: str):
+    """Delete a portrait by id."""
+    if not delete_portrait(portrait_id):
+        raise HTTPException(status_code=404, detail="portrait not found")
+    return {"deleted": portrait_id}
+
+
+# ── Portrait expand → hunt (C5) ─────────────────────────────────────────
+@router.post("/portraits/build", dependencies=[Depends(require_api_access)])
+async def build_portrait_api(payload: PortraitCreate):
+    """Build a portrait from source domains via LLM (consumes quota)."""
+    return await build_portrait(
+        name=payload.name,
+        source_domains=payload.source_customers,
+        insight_summary=payload.insight_summary,
+    )
+
+
+@router.post("/portraits/{portrait_id}/expand", dependencies=[Depends(require_api_access)])
+async def expand_portrait(portrait_id: str, target_lead_count: int = 1, max_rounds: int = 1):
+    """Start a real hunt seeded by the portrait's ICP (consumes quota)."""
+    hunt_id = await start_hunt_from_portrait(
+        portrait_id, target_lead_count=target_lead_count, max_rounds=max_rounds
+    )
+    return {"hunt_id": hunt_id, "status": "pending"}
+
+
+# ── Lead enrichment (C6) ────────────────────────────────────────────────
+def _normalize_domain(url: str) -> str:
+    raw = (url or "").strip().lower()
+    raw = re.sub(r"^https?://", "", raw)
+    raw = raw.split("/")[0].split("?")[0].split("#")[0]
+    if raw.startswith("www."):
+        raw = raw[4:]
+    return raw.strip()
+
+
+@router.post("/hunts/{hunt_id}/leads/{lead_key}/enrich", dependencies=[Depends(require_api_access)])
+async def enrich_lead(hunt_id: str, lead_key: str):
+    """Enrich a lead with social/contact data (no-op when no API key)."""
+    lead = find_lead(hunt_id, lead_key)
+    if lead is None:
+        raise HTTPException(status_code=404, detail="lead not found")
+    domain = _normalize_domain(str(lead.get("website") or ""))
+    social = SocialEnricher().enrich(domain=domain)
+    if social:
+        lead.setdefault("social_data", {}).update(social)
+        updated = update_lead(hunt_id, lead_key, {"social_data": lead.get("social_data")})
+        if updated is None:
+            raise HTTPException(status_code=500, detail="failed to persist enrichment")
+    return {"lead_key": lead_key, "social_data": social}
 
 
 @router.get("/hunts/{hunt_id}/cost", dependencies=[Depends(require_api_access)])

@@ -31,6 +31,7 @@ import httpx
 
 from config.settings import get_settings
 from graph.state import HuntState
+from utils.storage import get_blacklists, has_contacted_before as storage_has_contacted_before
 from tools.contact_extractor import (
     discover_contact_pages,
     extract_phone_numbers,
@@ -866,6 +867,64 @@ def _official_website_domain(url: str) -> str:
     return _normalized_domain(url)
 
 
+# ── Hunt filter application (business-optimization) ─────────────────────
+def _filter_bare_domain(value: str) -> str:
+    """Lowercase host without scheme/www/port/path — works for scheme-less
+    ``www.example.com`` strings that ``urlparse`` cannot handle."""
+    raw = (value or "").strip().lower()
+    raw = re.sub(r"^https?://", "", raw)
+    raw = raw.split("/")[0].split("?")[0].split("#")[0]
+    if raw.startswith("www."):
+        raw = raw[4:]
+    return raw.strip()
+
+
+def _blacklist_matches_lead(lead: dict) -> tuple[bool, str]:
+    """Return (matched, reason) when a lead hits a configured blacklist entry."""
+    items = get_blacklists()
+    if not items:
+        return False, ""
+    domain = _filter_bare_domain(str(lead.get("website") or ""))
+    company = str(lead.get("company_name") or "").lower()
+    haystack = " ".join([
+        company,
+        str(lead.get("industry") or "").lower(),
+    ])
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        value = str(item.get("value") or "").strip().lower()
+        if not value:
+            continue
+        itype = str(item.get("type") or "keyword").lower()
+        if itype == "domain":
+            needle = _filter_bare_domain(value)
+            if needle and domain and (domain == needle or domain.endswith("." + needle)):
+                return True, f"blacklist_domain:{value}"
+        else:
+            if value and value in haystack:
+                return True, f"blacklist_keyword:{value}"
+    return False, ""
+
+
+def _lead_should_be_filtered(lead: dict, filters: dict | None) -> tuple[bool, str]:
+    """Apply a hunt's filter rules to a finalized lead candidate."""
+    if not isinstance(filters, dict):
+        return False, ""
+    try:
+        if bool(filters.get("use_blacklist", True)):
+            matched, reason = _blacklist_matches_lead(lead)
+            if matched:
+                return True, reason
+        if bool(filters.get("exclude_contacted", True)):
+            domain = _filter_bare_domain(str(lead.get("website") or ""))
+            if domain and storage_has_contacted_before(domain):
+                return True, "exclude_contacted"
+    except Exception as e:  # defensive — never block extraction
+        logger.warning("[LeadExtractAgent] filter check error (kept lead): %s", e)
+    return False, ""
+
+
 # ── ReAct system prompt for per-URL lead extraction ──────────────────────
 
 REACT_LEAD_SYSTEM = """You are a B2B lead research agent. Your goal: research a candidate company, extract company + contact info, find key decision makers, verify contact channels, collect concrete customs/trade data, score their fit, and output a structured JSON lead.
@@ -1630,9 +1689,13 @@ async def lead_extract_node(state: HuntState) -> dict:
         await llm.close()
         await google.close()
 
-    # ── Collect valid leads, deduplicate ─────────────────────────────────
+    # ── Collect valid leads, deduplicate + apply hunt filters ─────────────
     new_leads = []
     seen_domains = set(existing_domains)
+    hunt_filters = state.get("filters")
+    hunt_filters = hunt_filters if isinstance(hunt_filters, dict) else None
+    filtered_out = 0
+    filter_reasons: dict[str, int] = {}
 
     for lead in results:
         if lead is None:
@@ -1642,7 +1705,22 @@ async def lead_extract_node(state: HuntState) -> dict:
             continue
         if official_domain:
             seen_domains.add(official_domain)
+        if hunt_filters:
+            dropped, reason = _lead_should_be_filtered(lead, hunt_filters)
+            if dropped:
+                filtered_out += 1
+                filter_reasons[reason] = filter_reasons.get(reason, 0) + 1
+                continue
         new_leads.append(lead)
+
+    prior_filter_stats = state.get("filter_stats")
+    prior_filter_stats = prior_filter_stats if isinstance(prior_filter_stats, dict) else {}
+    merged_filter_stats = dict(prior_filter_stats)
+    merged_filter_stats["total_filtered"] = int(prior_filter_stats.get("total_filtered", 0)) + filtered_out
+    by_reason = dict(prior_filter_stats.get("by_reason") or {})
+    for reason, count in filter_reasons.items():
+        by_reason[reason] = int(by_reason.get(reason, 0)) + count
+    merged_filter_stats["by_reason"] = by_reason
 
     # ── Verify emails via MX record check (concurrent) ───────────────────
     # Remove emails whose domains have no MX records, indicating the domain
@@ -1664,5 +1742,6 @@ async def lead_extract_node(state: HuntState) -> dict:
     return {
         "leads": existing_leads + new_leads,
         "keyword_search_stats": keyword_stats,
+        "filter_stats": merged_filter_stats,
         "current_stage": "lead_extract",
     }

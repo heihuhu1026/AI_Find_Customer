@@ -52,6 +52,13 @@ class HuntState(TypedDict):
     prev_round_lead_count: int              # lead count at end of previous round
     round_feedback: Optional[dict]          # feedback summary for KeywordGenAgent
 
+    # ── Business-optimization (hunt mode + filters) ─────────────────────
+    mode: Optional[str]                     # 'forward' | 'reverse' | 'hybrid'
+    competitors: list[str]                  # reverse/hybrid competitor domains
+    reverse_templates: list[str]            # reverse-search prompt templates
+    filters: Optional[dict]                 # {use_blacklist, exclude_contacted}
+    filter_stats: Optional[dict]            # cumulative {total_filtered, by_reason}
+
     # ── Metadata ────────────────────────────────────────────────────────
     current_stage: str
     hunt_id: str                             # hunt identifier for cost tracking

@@ -105,6 +105,9 @@ class SettingsPayload(BaseModel):
     search_concurrency: str = ""
     scrape_concurrency: str = ""
     global_crawl_dedup: str = ""
+    social_api_provider: str = ""
+    social_api_key: str = ""
+    social_api_timeout: str = ""
 
 
 class SettingsResponse(BaseModel):
@@ -263,6 +266,9 @@ async def save_settings(payload: SettingsPayload):
         "search_concurrency": "SEARCH_CONCURRENCY",
         "scrape_concurrency": "SCRAPE_CONCURRENCY",
         "global_crawl_dedup": "GLOBAL_CRAWL_DEDUP",
+        "social_api_provider": "SOCIAL_API_PROVIDER",
+        "social_api_key": "SOCIAL_API_KEY",
+        "social_api_timeout": "SOCIAL_API_TIMEOUT",
     }
 
     updates: dict[str, str] = {}
