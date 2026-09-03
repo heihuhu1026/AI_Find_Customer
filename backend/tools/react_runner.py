@@ -27,6 +27,10 @@ from tools.llm_client import (
     normalize_model_name,
     _is_switchable_error,
     _prefix_model,
+    _is_param_unsupported_error,
+    _extract_unsupported_params,
+    _record_unsupported_param,
+    _scrub_unsupported_params,
 )
 from tools.llm_rate_limiter import get_llm_rate_limiter
 
@@ -81,6 +85,13 @@ async def _completion(settings: Settings, *, scope: str = "reasoning", **kwargs:
     except _ModelSwitch:
         raise
     except Exception as e:  # noqa: BLE001
+        if _is_param_unsupported_error(e):
+            # Model rejected a param (e.g. kimi-k3 rejects temperature): remember
+            # it so future calls to this model scrub it, then switch models.
+            _mdl = kwargs.get("model")
+            if _mdl:
+                for _p in _extract_unsupported_params(e):
+                    _record_unsupported_param(_mdl, _p)
         if _is_switchable_error(e):
             raise _ModelSwitch(str(e)) from e
         raise
@@ -345,6 +356,8 @@ async def _react_run_once(
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        # Drop params this model is known to reject (e.g. kimi-k3 → temperature).
+        kwargs = _scrub_unsupported_params(model, kwargs)
         if tool_schemas:
             kwargs["tools"] = tool_schemas
             if is_last:
@@ -382,6 +395,7 @@ async def _react_run_once(
                         "temperature": temperature,
                         "max_tokens": max_tokens,
                     }
+                    fallback_kwargs = _scrub_unsupported_params(model, fallback_kwargs)
                     response = await _completion(_settings, scope=model_scope, **fallback_kwargs)
                     _record_react_cost(response, hunt_id, agent, model, hunt_round)
                 except _ModelSwitch:
@@ -438,13 +452,13 @@ async def _react_run_once(
             # Use a dedicated nudge sub-loop to avoid consuming main iterations
             for nudge in range(_MAX_JSON_NUDGES):
                 try:
-                    nudge_resp = await _completion(
-                        _settings, scope=model_scope,
-                        model=model,
-                        messages=nudge_messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                    )
+                    _nudge_kwargs = _scrub_unsupported_params(model, {
+                        "model": model,
+                        "messages": nudge_messages,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                    })
+                    nudge_resp = await _completion(_settings, scope=model_scope, **_nudge_kwargs)
                     _record_react_cost(nudge_resp, hunt_id, agent, model, hunt_round)
                     nudge_content = nudge_resp.choices[0].message.content or ""
                     nudge_parsed = _try_parse_json(nudge_content)
@@ -515,13 +529,13 @@ async def _react_run_once(
 
     for attempt in range(_MAX_JSON_NUDGES + 1):
         try:
-            response = await _completion(
-                _settings, scope=model_scope,
-                model=model,
-                messages=final_messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
+            _final_kwargs = _scrub_unsupported_params(model, {
+                "model": model,
+                "messages": final_messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            })
+            response = await _completion(_settings, scope=model_scope, **_final_kwargs)
             _record_react_cost(response, hunt_id, agent, model, hunt_round)
             content = response.choices[0].message.content or ""
             parsed = _try_parse_json(content)

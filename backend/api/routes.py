@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 import uuid
 from pathlib import Path
 from datetime import datetime, timezone
@@ -29,6 +30,7 @@ from tools.llm_client import LLMTool
 from emailing.smtp_client import send_smtp_email
 from api.hunt_store import load_all_hunts, save_hunt, now_iso
 from api.security import require_api_access
+from api.errors import safe_error_detail
 from graph.builder import build_graph
 from graph.evaluate import evaluate_progress, should_continue_hunting, _build_keyword_performance
 from observability.cost_tracker import get_tracker, remove_tracker
@@ -41,6 +43,12 @@ _hunts: dict[str, dict] = load_all_hunts(mark_interrupted=True)
 # SSE event queues per hunt — subscribers listen here
 _sse_queues: dict[str, list[asyncio.Queue]] = {}
 _reply_detection_task: asyncio.Task[Any] | None = None
+
+# Throttle for incremental lead persistence: lead_extract can emit many leads
+# per second and save_hunt rewrites the whole hunt JSON on every call. Flush at
+# most once per interval; authoritative state is still checkpointed at stage
+# changes and fully flushed at hunt end, so this only bounds the kill-9 window.
+_LEAD_SAVE_INTERVAL_SECONDS = 2.0
 
 
 class HuntCancelledError(RuntimeError):
@@ -611,9 +619,14 @@ async def _run_hunt(hunt_id: str, request: HuntRequest) -> None:
     }
 
     # Wire per-URL progress callback → SSE broadcast + incremental disk save
+    _throttle_state = {"last_save": 0.0}
+
     def _on_lead_progress(data: dict) -> None:
         _broadcast(hunt_id, "lead_progress", data)
-        # Incrementally persist each lead as it's found — survives kill -9
+        # Incrementally persist leads as they're found — survives kill -9.
+        # Throttled: save_hunt rewrites the whole hunt JSON, so flush at most
+        # once per _LEAD_SAVE_INTERVAL_SECONDS (authoritative state is still
+        # checkpointed at stage changes and fully flushed at hunt end).
         if data.get("event") == "lead_found" and data.get("lead"):
             hunt = _hunts.get(hunt_id)
             if hunt is not None:
@@ -621,7 +634,11 @@ async def _run_hunt(hunt_id: str, request: HuntRequest) -> None:
                 leads = result.setdefault("leads", [])
                 leads.append(data["lead"])
                 hunt["leads_count"] = _unique_leads_count(leads)
-                save_hunt(hunt_id, hunt)
+                now = time.monotonic()
+                if now - _throttle_state["last_save"] >= _LEAD_SAVE_INTERVAL_SECONDS:
+                    if not save_hunt(hunt_id, hunt):
+                        logger.error("[Hunt %s] Failed to persist incremental leads", hunt_id[:8])
+                    _throttle_state["last_save"] = now
 
     set_progress_callback(_on_lead_progress)
 
@@ -876,9 +893,14 @@ async def _run_resume_hunt(hunt_id: str, request: ResumeRequest, prior_result: d
 
     initial_state = _slim_state(prior_result, request)
 
+    _throttle_state = {"last_save": 0.0}
+
     def _on_lead_progress(data: dict) -> None:
         _broadcast(hunt_id, "lead_progress", data)
-        # Incrementally persist each lead as it's found — survives kill -9
+        # Incrementally persist leads as they're found — survives kill -9.
+        # Throttled: save_hunt rewrites the whole hunt JSON, so flush at most
+        # once per _LEAD_SAVE_INTERVAL_SECONDS (authoritative state is still
+        # checkpointed at stage changes and fully flushed at hunt end).
         if data.get("event") == "lead_found" and data.get("lead"):
             hunt = _hunts.get(hunt_id)
             if hunt is not None:
@@ -886,7 +908,11 @@ async def _run_resume_hunt(hunt_id: str, request: ResumeRequest, prior_result: d
                 leads = result.setdefault("leads", [])
                 leads.append(data["lead"])
                 hunt["leads_count"] = _unique_leads_count(leads)
-                save_hunt(hunt_id, hunt)
+                now = time.monotonic()
+                if now - _throttle_state["last_save"] >= _LEAD_SAVE_INTERVAL_SECONDS:
+                    if not save_hunt(hunt_id, hunt):
+                        logger.error("[Hunt %s] Failed to persist incremental leads", hunt_id[:8])
+                    _throttle_state["last_save"] = now
 
     set_progress_callback(_on_lead_progress)
 
@@ -1268,7 +1294,7 @@ async def send_email_sequence_draft(
             body_text=str(draft.get("body_text", "") or ""),
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=safe_error_detail(exc, context="send-draft")) from exc
 
     draft["send_status"] = "sent"
     draft["sent_at"] = now_iso()
@@ -1322,7 +1348,7 @@ async def detect_email_sequence_replies(
     try:
         replies = await asyncio.to_thread(search_recent_replies, settings, from_address=recipient)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=safe_error_detail(exc, context="reply-check")) from exc
 
     sequence["reply_detection"] = {
         "checked_at": now_iso(),

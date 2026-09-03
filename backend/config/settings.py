@@ -152,6 +152,13 @@ class Settings(BaseSettings):
     # Jina Reader page fetch: 0 disables network fetch (uses search snippet only).
     jina_reader_enabled: bool = True
 
+    # --- Cross-task crawl deduplication ---
+    # When True (default), domains already crawled in previous hunts are skipped
+    # during lead extraction, preventing duplicate page fetches / ReAct runs across
+    # multiple search tasks. Set False to crawl every candidate fresh each hunt.
+    # Persistent record: backend/data/global_crawl_dedup.json (delete file to fully reset).
+    global_crawl_dedup: bool = True
+
     # --- Email ---
     email_provider_type: str = "smtp"
     email_from_name: str = "B2Binsights"

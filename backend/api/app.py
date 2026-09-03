@@ -524,13 +524,28 @@ async def _email_reply_loop() -> None:
         await asyncio.sleep(max(30, int(settings.email_reply_check_interval_seconds)))
 
 
+# Bounded capacity for the "already notified" trackers. These used to be plain
+# unbounded sets, which grew for the entire process lifetime and slowly leaked
+# memory. dicts keep insertion order, so the oldest entry can be evicted.
+_SEEN_IDS_MAX = 10000
+
+
+def _remember_seen(seen: dict[str, bool], key: str) -> None:
+    """Record `key` in the bounded `seen` map, evicting the oldest entry if full."""
+    if key in seen:
+        return
+    if len(seen) >= _SEEN_IDS_MAX:
+        del seen[next(iter(seen))]
+    seen[key] = True
+
+
 async def _automation_notify_loop() -> None:
     last_summary_at = 0.0
     last_alert_at = 0.0
     discovery_buffer: list[dict[str, str | int]] = []
     send_buffer: list[dict[str, str]] = []
-    seen_hunt_ids: set[str] = set()
-    seen_sent_message_ids: set[str] = set()
+    seen_hunt_ids: dict[str, bool] = {}
+    seen_sent_message_ids: dict[str, bool] = {}
     primed = False
     last_discovery_flush_at = 0.0
     last_send_flush_at = 0.0
@@ -553,15 +568,13 @@ async def _automation_notify_loop() -> None:
                 store = EmailStore(settings.email_db_path)
                 store.init_db()
                 if not primed:
-                    seen_hunt_ids.update(
-                        hunt_id for hunt_id, hunt in hunts.items()
-                        if str(hunt.get("status", "") or "") == "completed"
-                    )
-                    seen_sent_message_ids.update(
-                        str(item.get("id", "") or "")
-                        for item in store.list_sent_messages_since(since_iso="1970-01-01T00:00:00+00:00", limit=5000)
-                        if str(item.get("id", "") or "")
-                    )
+                    for hunt_id, hunt in hunts.items():
+                        if str(hunt.get("status", "") or "") == "completed":
+                            _remember_seen(seen_hunt_ids, hunt_id)
+                    for item in store.list_sent_messages_since(since_iso="1970-01-01T00:00:00+00:00", limit=5000):
+                        message_id = str(item.get("id", "") or "")
+                        if message_id:
+                            _remember_seen(seen_sent_message_ids, message_id)
                     primed = True
                     last_discovery_flush_at = now_monotonic
                     last_send_flush_at = now_monotonic
@@ -571,7 +584,7 @@ async def _automation_notify_loop() -> None:
                         continue
                     if str(hunt.get("status", "") or "") != "completed":
                         continue
-                    seen_hunt_ids.add(hunt_id)
+                    _remember_seen(seen_hunt_ids, hunt_id)
                     result = hunt.get("result") or {}
                     for lead in result.get("leads", []) or []:
                         if not isinstance(lead, dict):
@@ -587,7 +600,7 @@ async def _automation_notify_loop() -> None:
                     message_id = str(item.get("id", "") or "")
                     if not message_id or message_id in seen_sent_message_ids:
                         continue
-                    seen_sent_message_ids.add(message_id)
+                    _remember_seen(seen_sent_message_ids, message_id)
                     send_buffer.append({
                         "company_name": str(item.get("lead_name", "") or ""),
                         "lead_email": str(item.get("lead_email", "") or ""),

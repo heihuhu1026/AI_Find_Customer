@@ -317,9 +317,13 @@ export function DashboardPage() {
                       当前阶段 {hunt.current_stage || "-"} · 已发现 {hunt.leads_count} 家企业 · 邮件序列 {hunt.email_sequences_count}
                     </p>
                   </div>
-                  <Link to="/hunts/$huntId" params={{ huntId: hunt.hunt_id }} className="text-primary hover:underline">
-                    查看详情
-                  </Link>
+                  {hunt.hunt_id ? (
+                    <Link to="/hunts/$huntId" params={{ huntId: hunt.hunt_id }} className="text-primary hover:underline">
+                      查看详情
+                    </Link>
+                  ) : (
+                    <span className="text-muted-foreground">查看详情</span>
+                  )}
                 </div>
               </div>
             ))}

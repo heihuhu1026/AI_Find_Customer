@@ -147,6 +147,94 @@ _assess_cache: dict = {}
 cache_stats = {"page_hits": 0, "page_miss": 0, "extract_hits": 0, "assess_hits": 0}
 
 
+# --- Global cross-task crawl dedup (avoid re-crawling pages across hunts) ---
+_GLOBAL_DEDUP_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "global_crawl_dedup.json"
+)
+_GLOBAL_DEDUP_LOCK = threading.Lock()
+_global_crawled_domains_mem: set | None = None
+
+
+def _seed_domains_from_hunts() -> set:
+    """Best-effort: pre-fill the global dedup set from historical hunt leads.
+
+    Lets the very first run also skip domains crawled by *past* tasks (not just
+    tasks run after this feature shipped).
+    """
+    domains: set = set()
+    try:
+        hunts_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "hunts"
+        )
+        if not os.path.isdir(hunts_dir):
+            return domains
+        for fname in os.listdir(hunts_dir):
+            if not fname.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(hunts_dir, fname), encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except Exception:
+                continue
+            for lead in (data.get("leads") or []):
+                if not isinstance(lead, dict):
+                    continue
+                d = _official_website_domain(lead.get("website", ""))
+                if d:
+                    domains.add(d)
+    except Exception:
+        pass
+    return domains
+
+
+def _global_crawled_domains_load() -> set:
+    """Load the persistent set of domains already crawled in prior hunts.
+
+    Cold start (file missing) seeds from historical hunt leads, then saves, so
+    past tasks are also counted. Memoized in-process for the session.
+    """
+    global _global_crawled_domains_mem
+    if _global_crawled_domains_mem is not None:
+        return _global_crawled_domains_mem
+    with _GLOBAL_DEDUP_LOCK:
+        if _global_crawled_domains_mem is None:
+            domains: set = set()
+            try:
+                if os.path.exists(_GLOBAL_DEDUP_PATH):
+                    with open(_GLOBAL_DEDUP_PATH, encoding="utf-8") as fh:
+                        domains = set(json.load(fh).get("domains", []))
+                else:
+                    domains = _seed_domains_from_hunts()
+                    if domains:
+                        os.makedirs(os.path.dirname(_GLOBAL_DEDUP_PATH), exist_ok=True)
+                        with open(_GLOBAL_DEDUP_PATH, "w", encoding="utf-8") as fh:
+                            json.dump({"domains": sorted(domains)}, fh)
+            except Exception:
+                domains = set()
+            _global_crawled_domains_mem = domains
+    return _global_crawled_domains_mem
+
+
+def _global_crawled_domains_add(domains: set) -> None:
+    """Merge `domains` into the persistent global crawled-domain set (atomic write)."""
+    if not domains:
+        return
+    mem = _global_crawled_domains_load()
+    with _GLOBAL_DEDUP_LOCK:
+        before = len(mem)
+        mem |= domains
+        if len(mem) == before:
+            return
+        try:
+            os.makedirs(os.path.dirname(_GLOBAL_DEDUP_PATH), exist_ok=True)
+            tmp = _GLOBAL_DEDUP_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"domains": sorted(mem)}, fh)
+            os.replace(tmp, _GLOBAL_DEDUP_PATH)
+        except Exception:
+            pass
+
+
 def _hash(s: str) -> str:
     return str(hash(s))
 
@@ -1374,6 +1462,16 @@ async def lead_extract_node(state: HuntState) -> dict:
     }
     to_process = []
     seen_candidate_domains: set[str] = set(existing_domains)
+
+    # Cross-task crawl dedup: fold in domains already crawled by previous hunts
+    # so we don't re-fetch / re-run ReAct on the same company sites this hunt.
+    global_prior_domains: set[str] = set()
+    if getattr(settings, "global_crawl_dedup", True):
+        global_prior_domains = _global_crawled_domains_load()
+        if global_prior_domains:
+            seen_candidate_domains |= global_prior_domains
+
+    pre_skipped = 0
     for r in search_results:
         link = r.get("link", "")
         maps_title = (r.get("title") or (r.get("maps_data") or {}).get("title") or "").strip()
@@ -1383,6 +1481,7 @@ async def lead_extract_node(state: HuntState) -> dict:
         if link_official_domain and link_official_domain in existing_domains:
             continue
         if link_official_domain and link_official_domain in seen_candidate_domains:
+            pre_skipped += 1
             continue
         if link_official_domain:
             seen_candidate_domains.add(link_official_domain)
@@ -1393,6 +1492,19 @@ async def lead_extract_node(state: HuntState) -> dict:
         r for r in to_process
         if (not r.get("link")) or classify_url(r.get("link", "")) != "irrelevant"
     ]
+
+    # Record this hunt's actually-crawled domains into the global dedup store so
+    # future hunts skip them. Only genuinely-new (processable) domains are added.
+    if getattr(settings, "global_crawl_dedup", True) and processable:
+        _proc_domains = {
+            d for d in (_official_website_domain(r.get("link", "")) for r in processable) if d
+        }
+        if _proc_domains:
+            _global_crawled_domains_add(_proc_domains)
+            logger.info(
+                "[LeadExtractAgent] Global crawl dedup: %d prior domains, %d candidates pre-skipped, %d new domains recorded",
+                len(global_prior_domains), pre_skipped, len(_proc_domains),
+            )
 
     logger.info(
         "[LeadExtractAgent] %d URLs to process (%d irrelevant filtered out)",

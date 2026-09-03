@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from config.settings import get_settings
 from config.settings_store import is_configured, read_settings, update_settings
 from automation.notifier import send_feishu_text
+from api.errors import safe_error_detail
 from emailing.imap_client import test_imap_connection
 from emailing.smtp_client import test_smtp_connection
 
@@ -103,6 +104,7 @@ class SettingsPayload(BaseModel):
     automation_alert_failed_messages_threshold: str = ""
     search_concurrency: str = ""
     scrape_concurrency: str = ""
+    global_crawl_dedup: str = ""
 
 
 class SettingsResponse(BaseModel):
@@ -260,6 +262,7 @@ async def save_settings(payload: SettingsPayload):
         "automation_alert_failed_messages_threshold": "AUTOMATION_ALERT_FAILED_MESSAGES_THRESHOLD",
         "search_concurrency": "SEARCH_CONCURRENCY",
         "scrape_concurrency": "SCRAPE_CONCURRENCY",
+        "global_crawl_dedup": "GLOBAL_CRAWL_DEDUP",
     }
 
     updates: dict[str, str] = {}
@@ -298,7 +301,7 @@ async def test_email_settings():
     try:
         result = await asyncio.to_thread(test_smtp_connection, settings)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=safe_error_detail(exc, context="smtp-test")) from exc
     tested_at = _now_iso()
     update_settings({"EMAIL_SMTP_LAST_TEST_AT": tested_at})
     _os.environ["EMAIL_SMTP_LAST_TEST_AT"] = tested_at
@@ -319,7 +322,7 @@ async def test_email_imap_settings():
     try:
         result = await asyncio.to_thread(test_imap_connection, settings)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=safe_error_detail(exc, context="imap-test")) from exc
     tested_at = _now_iso()
     update_settings({"EMAIL_IMAP_LAST_TEST_AT": tested_at})
     _os.environ["EMAIL_IMAP_LAST_TEST_AT"] = tested_at
@@ -353,7 +356,7 @@ async def test_automation_feishu_webhook():
             ),
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=safe_error_detail(exc, context="feishu-test")) from exc
     return FeishuTestResponse(
         status="ok",
         message="Feishu webhook test sent",

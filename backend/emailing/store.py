@@ -115,6 +115,10 @@ class EmailStore:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        # Shared by the API process, the email scheduler and standalone workers.
+        # WAL + busy_timeout prevent "database is locked" under concurrent writers.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
     def init_db(self) -> None:

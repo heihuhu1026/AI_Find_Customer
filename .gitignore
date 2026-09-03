@@ -118,3 +118,13 @@ backend/leads_report_*.html
 backend/_make_report.py
 start-backend.bat
 start-frontend.bat
+
+# ── SQLite WAL / shared-memory temp files (runtime, never commit) ──
+*.db-shm
+*.db-wal
+*.db-journal
+
+# ── Runtime caches / generated deliverables (never commit) ──
+backend/template_seed_cache.json
+backend/email_template_hdmi_us.md
+backend/leads_us_hdmi_dedup.csv

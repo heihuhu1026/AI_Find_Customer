@@ -49,6 +49,64 @@ def _prefix_model(model: str) -> str:
     return _DASHSCOPE_PREFIX + model
 
 
+# ---------------------------------------------------------------------------
+# Per-model unsupported-parameter handling (self-healing fallback)
+#
+# Some providers/models reject certain sampling parameters — e.g. DashScope's
+# kimi-k3 rejects `temperature` and returns HTTP 400
+# ("Parameter 'temperature' is not supported for kimi-k3 model").
+#
+# Rather than hard-code a model→param matrix (which would rot as the fallback
+# chain changes), we discover rejections lazily at runtime: the first HTTP-400
+# from a model records the offending parameter in `_MODEL_UNSUPPORTED_PARAMS`,
+# and every subsequent call to that model scrubs it before hitting the API.
+# This keeps the fallback chain resilient without manual upkeep, and also makes
+# the error switchable so the chain tries the next model instead of aborting.
+# ---------------------------------------------------------------------------
+_MODEL_UNSUPPORTED_PARAMS: dict[str, set[str]] = {}
+
+# Sampling/penalty params that litellm forwards and that some models reject.
+_UNSUPPORTED_PARAM_KEYWORDS = (
+    "temperature", "top_p", "top_k", "presence_penalty",
+    "frequency_penalty", "repetition_penalty",
+)
+
+
+def _is_param_unsupported_error(exc: Exception) -> bool:
+    """True if the error is a model rejecting a request parameter (HTTP 400).
+
+    Covers messages like "Parameter 'temperature' is not supported" /
+    "InvalidParameter" / "unsupported parameter".
+    """
+    msg = (str(exc) or "").lower()
+    if not ("not supported" in msg or "invalid parameter" in msg or "unsupported" in msg):
+        return False
+    # Only treat it as a param error when it actually names a known param,
+    # or mentions "parameter" generically (avoids false positives on unrelated 400s).
+    return any(p in msg for p in _UNSUPPORTED_PARAM_KEYWORDS) or "parameter" in msg
+
+
+def _extract_unsupported_params(exc: Exception) -> set[str]:
+    """Return the set of sampling params the error says are unsupported."""
+    msg = (str(exc) or "").lower()
+    return {p for p in _UNSUPPORTED_PARAM_KEYWORDS if p in msg}
+
+
+def _record_unsupported_param(model: str, param: str) -> None:
+    """Remember that `model` rejects `param` so future calls can scrub it."""
+    if not model or not param:
+        return
+    _MODEL_UNSUPPORTED_PARAMS.setdefault(model, set()).add(param)
+
+
+def _scrub_unsupported_params(model: str, kwargs: dict) -> dict:
+    """Return a copy of kwargs with params known to be rejected by `model` removed."""
+    banned = _MODEL_UNSUPPORTED_PARAMS.get(model)
+    if not banned:
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k not in banned}
+
+
 def _is_switchable_error(exc: Exception) -> bool:
     """Return True if the error warrants switching to the next fallback model.
 
@@ -84,6 +142,7 @@ def _is_switchable_error(exc: Exception) -> bool:
             "model_not_found", "does not exist", "invalid model",
             "502", "503", "504", "timeout", "timed out", "connection",
             "upstream", "server error", "internal error", "too many requests",
+            "not supported", "invalid parameter", "unsupported",
         )
     )
     return switchable
@@ -289,8 +348,10 @@ class LLMTool:
         fb_env = self._settings.llm_model_fallback
         if self._model_type == "reasoning":
             fb_env = self._settings.reasoning_model_fallback or self._settings.llm_model_fallback
-        elif self._model_type in {"email", "email_reasoning"}:
-            fb_env = getattr(self._settings, f"{self._model_type}_model_fallback", "") or self._settings.llm_model_fallback
+        elif self._model_type == "email":
+            fb_env = self._settings.email_llm_model_fallback or self._settings.llm_model_fallback
+        elif self._model_type == "email_reasoning":
+            fb_env = self._settings.email_reasoning_model_fallback or self._settings.llm_model_fallback
         raw = [m.strip() for m in (fb_env or "").split(",") if m.strip()]
         chain = [primary] + [_prefix_model(m) for m in raw]
         seen: set[str] = set()
@@ -351,6 +412,10 @@ class LLMTool:
                 "temperature": temp,
                 "max_tokens": tokens,
             }
+            # Drop params this specific model is known to reject (e.g. kimi-k3
+            # rejects temperature). First occurrence records it; subsequent calls
+            # scrub automatically so we never waste a 400 on a known-bad param.
+            kwargs = _scrub_unsupported_params(model, kwargs)
             if response_format and self._supports_response_format_for(model):
                 kwargs["response_format"] = response_format
 
@@ -386,6 +451,12 @@ class LLMTool:
                     return response.choices[0].message.content
                 except Exception as exc:
                     last_exc = exc
+                    if _is_param_unsupported_error(exc):
+                        # Model rejected a param (e.g. kimi-k3 rejects temperature):
+                        # remember it so future calls to this model scrub it. The
+                        # error is also switchable, so we fall back to the next model.
+                        for _p in _extract_unsupported_params(exc):
+                            _record_unsupported_param(model, _p)
                     if not _is_switchable_error(exc):
                         # Hard error (bad key / unknown model / bad request) — no point retrying or switching.
                         raise RuntimeError(format_llm_error(exc)) from exc
