@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,10 +15,6 @@ from typing import Any
 from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
-
-# Serializes writes to the same hunt file and makes them atomic. Without this a
-# crash (or a concurrent writer) mid-write leaves a truncated JSON file behind.
-_save_lock = threading.Lock()
 
 
 def _hunts_dir() -> Path:
@@ -31,29 +25,14 @@ def _hunts_dir() -> Path:
     return p
 
 
-def save_hunt(hunt_id: str, hunt_data: dict[str, Any]) -> bool:
-    """Persist a hunt to disk as JSON (atomically).
-
-    Writes to a temporary file then ``os.replace``s it into place so readers
-    never observe a partially written file. Returns True on success; on failure
-    the error is logged and False is returned (callers that need to react to a
-    lost write can now do so).
-    """
-    path = _hunts_dir() / f"{hunt_id}.json"
-    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    payload = {"hunt_id": hunt_id, **hunt_data}
+def save_hunt(hunt_id: str, hunt_data: dict[str, Any]) -> None:
+    """Persist a hunt to disk as JSON."""
     try:
-        with _save_lock:
-            tmp_path.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
-            os.replace(tmp_path, path)
-        return True
+        path = _hunts_dir() / f"{hunt_id}.json"
+        payload = {"hunt_id": hunt_id, **hunt_data}
+        path.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
     except Exception as e:
         logger.warning("[HuntStore] Failed to save hunt %s: %s", hunt_id[:8], e)
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except Exception:  # pragma: no cover - best-effort cleanup
-            pass
-        return False
 
 
 def load_all_hunts(*, mark_interrupted: bool = False) -> dict[str, dict[str, Any]]:
@@ -75,10 +54,9 @@ def load_all_hunts(*, mark_interrupted: bool = False) -> dict[str, dict[str, Any
                 data["status"] = "failed"
                 data["error"] = "Process was interrupted (server restarted)"
                 data["completed_at"] = now_iso()
-                # Persist the updated status so it survives future restarts.
-                # Reuse save_hunt's atomic write (tmp + os.replace) instead of
-                # path.write_text, which could truncate the file on a crash.
-                save_hunt(hid, data)
+                # Persist the updated status so it survives future restarts
+                payload = {"hunt_id": hid, **data}
+                path.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
                 logger.info("[HuntStore] Marked interrupted hunt %s as failed", hid[:8])
             hunts[hid] = data
             logger.debug("[HuntStore] Loaded hunt %s (status=%s)", hid[:8], data.get("status"))

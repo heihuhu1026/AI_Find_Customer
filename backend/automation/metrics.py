@@ -69,12 +69,12 @@ def collect_automation_status(*, hunts: dict[str, dict[str, Any]] | None = None)
     store.init_db()
     hunt_map = _resolve_hunt_map(hunts)
 
-    running_hunts = [(hunt_id, hunt) for hunt_id, hunt in hunt_map.items() if str(hunt.get("status", "")) == "running"]
+    running_hunts = [hunt for hunt in hunt_map.values() if str(hunt.get("status", "")) == "running"]
     pending_hunts = sum(1 for hunt in hunt_map.values() if str(hunt.get("status", "")) == "pending")
     running_details = []
-    for hunt_id, hunt in running_hunts[:5]:
+    for hunt in running_hunts[:5]:
         running_details.append({
-            "hunt_id": str(hunt.get("hunt_id", "") or hunt_id or ""),
+            "hunt_id": str(hunt.get("hunt_id", "") or ""),
             "website_url": _hunt_website_url(hunt),
             "current_stage": str(hunt.get("current_stage", "") or ""),
             "leads_count": int(hunt.get("leads_count", 0) or 0),

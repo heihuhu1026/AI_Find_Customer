@@ -4,7 +4,7 @@ import { api, AutomationJob } from "@/api/client";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Plus, Crosshair, Users, Loader2, Globe, Clock, MapPin, Tag, Mail, Send, AlertTriangle, Workflow, Reply, Bell, Layers } from "lucide-react";
+import { Plus, Crosshair, Users, Loader2, Globe, Clock, MapPin, Tag, Mail, Send, AlertTriangle, Workflow, Reply, Bell } from "lucide-react";
 import { useMemo, useState } from "react";
 
 function formatTime(iso: string) {
@@ -74,9 +74,7 @@ export function DashboardPage() {
   const templateSeedWorker = automationStatus?.workers?.template_seed;
   const dashboardErrors = [jobsError, statusError, metricsError].filter(Boolean) as Error[];
   const feishuWebhook = settings?.settings?.AUTOMATION_FEISHU_WEBHOOK_URL || "";
-  // A masked placeholder still means "configured" — the backend only masks
-  // values it actually has. The previous ternary was a tautology.
-  const feishuConfigured = Boolean(feishuWebhook);
+  const feishuConfigured = Boolean(feishuWebhook && !feishuWebhook.includes("****") ? feishuWebhook : feishuWebhook.includes("****"));
   const summaryEnabled = (settings?.settings?.AUTOMATION_SUMMARY_ENABLED || "true") === "true";
   const alertsEnabled = (settings?.settings?.AUTOMATION_ALERTS_ENABLED || "true") === "true";
   const showFailed = eventFilter === "all" || eventFilter === "failed";
@@ -95,20 +93,12 @@ export function DashboardPage() {
           <h1 className="text-3xl font-bold tracking-tight">自动化控制台</h1>
           <p className="text-muted-foreground mt-1">前端负责提交 queue job，后端 consumer 负责准备模板 seed、执行 hunt、创建 campaign 和发送队列</p>
         </div>
-        <div className="flex items-center gap-2">
-          <Link to="/hunts/new">
-            <Button>
-              <Plus className="h-4 w-4 mr-2" />
-              新建任务
-            </Button>
-          </Link>
-          <Link to="/portraits">
-            <Button variant="outline">
-              <Layers className="h-4 w-4 mr-2" />
-              客户画像库
-            </Button>
-          </Link>
-        </div>
+        <Link to="/hunts/new">
+          <Button>
+            <Plus className="h-4 w-4 mr-2" />
+            新建任务
+          </Button>
+        </Link>
       </div>
 
       {dashboardErrors.length > 0 && (
@@ -327,13 +317,9 @@ export function DashboardPage() {
                       当前阶段 {hunt.current_stage || "-"} · 已发现 {hunt.leads_count} 家企业 · 邮件序列 {hunt.email_sequences_count}
                     </p>
                   </div>
-                  {hunt.hunt_id ? (
-                    <Link to="/hunts/$huntId" params={{ huntId: hunt.hunt_id }} className="text-primary hover:underline">
-                      查看详情
-                    </Link>
-                  ) : (
-                    <span className="text-muted-foreground">查看详情</span>
-                  )}
+                  <Link to="/hunts/$huntId" params={{ huntId: hunt.hunt_id }} className="text-primary hover:underline">
+                    查看详情
+                  </Link>
                 </div>
               </div>
             ))}

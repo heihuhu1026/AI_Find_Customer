@@ -1,130 +1,30 @@
-# ============================================================
-# AI Hunter — .gitignore
-# ============================================================
-
-# ── Secrets / Environment ────────────────────────────────────
+# ---------- Secrets / credentials ----------
 .env
-.env.local
-.env.*.local
-*.secret
+.env.*
+!.env.example
 
-# ── Python ──────────────────────────────────────────────────
+# ---------- Python ----------
 __pycache__/
-*.py[cod]
-*$py.class
-*.pyo
-
-# Virtual environments
-.venv/
+*.pyc
 venv/
-env/
-ENV/
-.venv_build/
-
-# Distribution / packaging
 *.egg-info/
-*.egg
-dist/
-build/
-.eggs/
-MANIFEST
-
-# Cython compiled artifacts (generated from .py source)
-*.c
-!backend/license/*.c
-*.so
-*.pyd
-
-# PyInstaller
-*.spec.bak
-backend/build/
-
-# pytest / coverage
 .pytest_cache/
-.coverage
-.coverage.*
-htmlcov/
-coverage.xml
-*.coveragerc
+backend/.pytest_cache/
 
-# mypy / type checking
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# ruff / linters
-.ruff_cache/
-
-# ── Runtime data (user-generated, not source) ────────────────
-data/
-uploads/
-backend/data/hunts/
-backend/uploads/
-*.db
-*.sqlite
-*.sqlite3
-
-# ── macOS ────────────────────────────────────────────────────
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-
-# ── Frontend (Node.js / Bun) ─────────────────────────────────
-frontend/node_modules/
+# ---------- Node / frontend ----------
+node_modules/
 frontend/dist/
-frontend/.cache/
-frontend/tsconfig.tsbuildinfo
 *.tsbuildinfo
 
-# ── Packaging / Desktop app artifacts ───────────────────────
-packaging/.venv_build/
-packaging/dist/
-packaging/*.dmg
-packaging/*.exe
-packaging/*.msi
-packaging/*.deb
-packaging/*.AppImage
+# ---------- Runtime data (kept on disk, NOT versioned) ----------
+*.db
+data/
+uploads/
 
-# Tauri: exclude heavy build artifacts only, keep source files for CI
-packaging/tauri/target/
-packaging/tauri/node_modules/
-
-# ── IDE / Editor ─────────────────────────────────────────────
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# ── Logs ─────────────────────────────────────────────────────
+# ---------- Logs ----------
 *.log
-logs/
+*.err
 
-# ── Jupyter ──────────────────────────────────────────────────
-.ipynb_checkpoints/
-*.ipynb
-
-# ── License server runtime ───────────────────────────────────
-license-server/.env
-
-# ── Local test artifacts & run outputs (never commit) ──────
-hunt_*.json
-backend/leads_*.csv
-backend/leads_report_*.html
-backend/_make_report.py
-start-backend.bat
-start-frontend.bat
-
-# ── SQLite WAL / shared-memory temp files (runtime, never commit) ──
-*.db-shm
-*.db-wal
-*.db-journal
-
-# ── Runtime caches / generated deliverables (never commit) ──
-backend/template_seed_cache.json
-backend/email_template_hdmi_us.md
-backend/leads_us_hdmi_dedup.csv
+# ---------- Runtime exports / caches ----------
+leads_us_hdmi_*.csv
+template_seed_cache.json

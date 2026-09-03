@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -113,33 +111,11 @@ class EmailStore:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
 
-    @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        """Yield a SQLite connection and guarantee it is committed and closed.
-
-        `with sqlite3.connect(...) as conn` only wraps a **transaction** — it
-        commits on success but never closes the connection. Since this method
-        opens a brand new connection on every call, the old code relied on the
-        garbage collector to release file handles and WAL locks, which made
-        connection churn under load non-deterministic.
-        """
+    def _connect(self) -> sqlite3.Connection:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path)
-        try:
-            conn.row_factory = sqlite3.Row
-            # Shared by the API process, the email scheduler and standalone workers.
-            # WAL + busy_timeout prevent "database is locked" under concurrent writers.
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=5000")
-            try:
-                yield conn
-            except BaseException:
-                conn.rollback()
-                raise
-            else:
-                conn.commit()
-        finally:
-            conn.close()
+        conn.row_factory = sqlite3.Row
+        return conn
 
     def init_db(self) -> None:
         with self._connect() as conn:

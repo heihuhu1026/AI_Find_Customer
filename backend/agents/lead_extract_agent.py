@@ -20,18 +20,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
-import threading
-import time
 from typing import Any, Callable
-from urllib.parse import urlparse, urlunparse
-
-import httpx
+from urllib.parse import urlparse
 
 from config.settings import get_settings
 from graph.state import HuntState
-from utils.storage import get_blacklists, has_contacted_before as storage_has_contacted_before
 from tools.contact_extractor import (
     discover_contact_pages,
     extract_phone_numbers,
@@ -57,194 +51,6 @@ logger = logging.getLogger(__name__)
 _progress_callback: Callable[[dict], None] | None = None
 
 
-# --- Token-optimization helpers (see TOKEN_OPTIMIZATION_PLAN.md) ---
-_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
-_PHONE_RE = re.compile(r"(?:\+?\d[\d\s().-]{7,}\d)")
-
-
-def _compress_scrape_for_history(content: str, head: int = 3000) -> str:
-    """Shrink a scraped page to a history-friendly size.
-
-    Keeps the leading ``head`` chars (company identity + description) and
-    re-appends any emails/phones found anywhere in the page, so downstream
-    ``extract_lead_info`` still sees contacts after trimming. Prevents the full
-    page from being re-sent on every ReAct iteration (biggest token waste).
-    """
-    body = content[:head]
-    extras: list[str] = []
-    seen: set[str] = set()
-    for m in list(_EMAIL_RE.finditer(content)) + list(_PHONE_RE.finditer(content)):
-        frag = m.group(0).strip()
-        if frag and frag not in seen:
-            seen.add(frag)
-            extras.append(frag)
-    if extras:
-        body += "\n\n[Contact snippets]\n" + "\n".join(extras[:40])
-    return body
-
-
-# --- Page + extraction caches (token optimization: D1/D2, see TOKEN_OPTIMIZATION_PLAN.md) ---
-_PAGE_CACHE_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "page_cache.json"
-)
-_PAGE_CACHE_TTL = 24 * 3600  # 24h
-_PAGE_CACHE_LOCK = threading.Lock()
-_page_cache_mem: dict = {}
-
-
-def _norm_url(url: str) -> str:
-    try:
-        p = urlparse(url)
-        host = p.netloc.lower()
-        path = p.path.rstrip("/")
-        return urlunparse((p.scheme.lower(), host, path, "", "", ""))
-    except Exception:
-        return url.strip().rstrip("/")
-
-
-def _page_cache_load() -> dict:
-    global _page_cache_mem
-    if _page_cache_mem:
-        return _page_cache_mem
-    with _PAGE_CACHE_LOCK:
-        if not _page_cache_mem:
-            try:
-                if os.path.exists(_PAGE_CACHE_PATH):
-                    with open(_PAGE_CACHE_PATH, encoding="utf-8") as fh:
-                        _page_cache_mem = json.load(fh)
-                else:
-                    _page_cache_mem = {}
-            except Exception as exc:
-                logger.warning("[LeadExtract] page cache load failed (%s); starting fresh", exc)
-                _page_cache_mem = {}
-    return _page_cache_mem
-
-
-def _page_cache_get(url: str):
-    c = _page_cache_load()
-    k = _norm_url(url)
-    with _PAGE_CACHE_LOCK:
-        e = c.get(k)
-    if not e:
-        return None
-    if time.time() - e.get("ts", 0) > _PAGE_CACHE_TTL:
-        return None
-    return e.get("content")
-
-
-def _page_cache_put(url: str, content: str) -> None:
-    c = _page_cache_load()
-    k = _norm_url(url)
-    with _PAGE_CACHE_LOCK:
-        c[k] = {"content": content, "ts": int(time.time())}
-        try:
-            os.makedirs(os.path.dirname(_PAGE_CACHE_PATH), exist_ok=True)
-            with open(_PAGE_CACHE_PATH, "w", encoding="utf-8") as fh:
-                json.dump(c, fh)
-        except Exception as exc:
-            logger.warning("[LeadExtract] page cache write failed: %s", exc)
-
-
-# In-memory result caches for deterministic-ish LLM calls (D2)
-_extract_cache: dict = {}
-_assess_cache: dict = {}
-cache_stats = {"page_hits": 0, "page_miss": 0, "extract_hits": 0, "assess_hits": 0}
-
-
-# --- Global cross-task crawl dedup (avoid re-crawling pages across hunts) ---
-_GLOBAL_DEDUP_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "global_crawl_dedup.json"
-)
-_GLOBAL_DEDUP_LOCK = threading.Lock()
-_global_crawled_domains_mem: set | None = None
-
-
-def _seed_domains_from_hunts() -> set:
-    """Best-effort: pre-fill the global dedup set from historical hunt leads.
-
-    Lets the very first run also skip domains crawled by *past* tasks (not just
-    tasks run after this feature shipped).
-    """
-    domains: set = set()
-    try:
-        hunts_dir = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "hunts"
-        )
-        if not os.path.isdir(hunts_dir):
-            return domains
-        for fname in os.listdir(hunts_dir):
-            if not fname.endswith(".json"):
-                continue
-            try:
-                with open(os.path.join(hunts_dir, fname), encoding="utf-8") as fh:
-                    data = json.load(fh)
-            except Exception as exc:
-                logger.debug("[LeadExtract] skipping unreadable hunt file %s: %s", fname, exc)
-                continue
-            for lead in (data.get("leads") or []):
-                if not isinstance(lead, dict):
-                    continue
-                d = _official_website_domain(lead.get("website", ""))
-                if d:
-                    domains.add(d)
-    except Exception as exc:
-        logger.warning("[LeadExtract] seeding global dedup from hunts failed: %s", exc)
-    return domains
-
-
-def _global_crawled_domains_load() -> set:
-    """Load the persistent set of domains already crawled in prior hunts.
-
-    Cold start (file missing) seeds from historical hunt leads, then saves, so
-    past tasks are also counted. Memoized in-process for the session.
-    """
-    global _global_crawled_domains_mem
-    if _global_crawled_domains_mem is not None:
-        return _global_crawled_domains_mem
-    with _GLOBAL_DEDUP_LOCK:
-        if _global_crawled_domains_mem is None:
-            domains: set = set()
-            try:
-                if os.path.exists(_GLOBAL_DEDUP_PATH):
-                    with open(_GLOBAL_DEDUP_PATH, encoding="utf-8") as fh:
-                        domains = set(json.load(fh).get("domains", []))
-                else:
-                    domains = _seed_domains_from_hunts()
-                    if domains:
-                        os.makedirs(os.path.dirname(_GLOBAL_DEDUP_PATH), exist_ok=True)
-                        with open(_GLOBAL_DEDUP_PATH, "w", encoding="utf-8") as fh:
-                            json.dump({"domains": sorted(domains)}, fh)
-            except Exception as exc:
-                logger.warning("[LeadExtract] global dedup load failed; starting empty: %s", exc)
-                domains = set()
-            _global_crawled_domains_mem = domains
-    return _global_crawled_domains_mem
-
-
-def _global_crawled_domains_add(domains: set) -> None:
-    """Merge `domains` into the persistent global crawled-domain set (atomic write)."""
-    if not domains:
-        return
-    mem = _global_crawled_domains_load()
-    with _GLOBAL_DEDUP_LOCK:
-        before = len(mem)
-        mem |= domains
-        if len(mem) == before:
-            return
-        try:
-            os.makedirs(os.path.dirname(_GLOBAL_DEDUP_PATH), exist_ok=True)
-            tmp = _GLOBAL_DEDUP_PATH + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({"domains": sorted(mem)}, fh)
-            os.replace(tmp, _GLOBAL_DEDUP_PATH)
-        except Exception:
-            pass
-
-
-def _hash(s: str) -> str:
-    return str(hash(s))
-
-
 def _candidate_budget(target_lead_count: int, scrape_concurrency: int) -> int:
     """Return a bounded candidate budget for deep extraction.
 
@@ -254,10 +60,7 @@ def _candidate_budget(target_lead_count: int, scrape_concurrency: int) -> int:
     """
     target = max(1, int(target_lead_count or 0))
     concurrency = max(1, int(scrape_concurrency or 0))
-    # 1.1: halve the lead-count multiple (target*4 -> target*2) to cut ReAct
-    # deep-extraction loops ~50% for large hunts. Hard cap prevents runaway on
-    # extreme targets.
-    return min(200, max(12, target * 2, concurrency * 4))
+    return max(12, target * 4, concurrency * 4)
 
 
 def set_progress_callback(cb: Callable[[dict], None] | None) -> None:
@@ -680,61 +483,14 @@ If uncertain, keep it.
 
 # ── Scrape & extract helpers ─────────────────────────────────────────────
 
-async def _direct_fetch(url: str) -> str:
-    """Best-effort fallback page fetch via plain HTTP.
-
-    Used when Jina Reader is disabled or blocked (e.g. an egress proxy that
-    only whitelists certain hosts). Many company sites are directly reachable,
-    so a plain GET + tag strip still yields enough text for lead extraction —
-    far better than returning nothing and letting the ReAct agent go blind.
-    """
-    try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, trust_env=True) as client:
-            resp = await client.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; LeadBot/1.0)"},
-            )
-            if resp.status_code != 200:
-                return ""
-            html = resp.text or ""
-            if not html:
-                return ""
-            # Strip <script>/<style> blocks, then all tags, then collapse whitespace.
-            body = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
-            body = re.sub(r"<[^>]+>", " ", body)
-            body = re.sub(r"\s+", " ", body).strip()
-            return body[:8000]
-    except Exception as e:
-        logger.debug("[LeadExtract] Direct fetch failed for %s: %s", url, e)
-        return ""
-
-
 async def _scrape_page(jina: JinaReaderTool, url: str) -> str:
-    """Scrape a single page, returning content or empty string on failure.
-
-    Tries Jina Reader first; if it is disabled/blocked/empty, falls back to a
-    direct HTTP fetch so lead extraction still has page content to work with.
-    Results are cached on disk (D1) so multi-round hunts / resume reuse pages
-    instead of re-fetching.
-    """
-    cached = _page_cache_get(url)
-    if cached:
-        cache_stats["page_hits"] += 1
-        logger.debug("[LeadExtract] page cache HIT %s", url)
-        return cached
-    cache_stats["page_miss"] += 1
+    """Scrape a single page, returning content or empty string on failure."""
     try:
         content = await jina.read(url)
-        if content and len(content.strip()) >= 50:
-            _page_cache_put(url, content)
-            return content
+        return content if content and len(content.strip()) >= 50 else ""
     except Exception as e:
-        logger.debug("[LeadExtract] Jina scrape failed for %s: %s", url, e)
-    # Fallback: direct HTTP GET (works when Jina Reader is unavailable).
-    direct = await _direct_fetch(url)
-    if direct:
-        _page_cache_put(url, direct)
-    return direct if direct else ""
+        logger.debug("Failed to scrape %s: %s", url, e)
+        return ""
 
 
 def _extract_contacts_from_text(text: str) -> tuple[list[str], list[str], dict[str, str]]:
@@ -872,94 +628,6 @@ def _official_website_domain(url: str) -> str:
     return _normalized_domain(url)
 
 
-# ── Hunt filter application (business-optimization) ─────────────────────
-def _filter_bare_domain(value: str) -> str:
-    """Lowercase host without scheme/www/port/path — works for scheme-less
-    ``www.example.com`` strings that ``urlparse`` cannot handle."""
-    raw = (value or "").strip().lower()
-    raw = re.sub(r"^https?://", "", raw)
-    raw = raw.split("/")[0].split("?")[0].split("#")[0]
-    if raw.startswith("www."):
-        raw = raw[4:]
-    return raw.strip()
-
-
-def _blacklist_matches_lead(lead: dict) -> tuple[bool, str]:
-    """Return (matched, reason) when a lead hits a configured blacklist entry."""
-    items = get_blacklists()
-    if not items:
-        return False, ""
-    domain = _filter_bare_domain(str(lead.get("website") or ""))
-    company = str(lead.get("company_name") or "").lower()
-    haystack = " ".join([
-        company,
-        str(lead.get("industry") or "").lower(),
-    ])
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        value = str(item.get("value") or "").strip().lower()
-        if not value:
-            continue
-        itype = str(item.get("type") or "keyword").lower()
-        if itype == "domain":
-            needle = _filter_bare_domain(value)
-            if needle and domain and (domain == needle or domain.endswith("." + needle)):
-                return True, f"blacklist_domain:{value}"
-        else:
-            if value and value in haystack:
-                return True, f"blacklist_keyword:{value}"
-    return False, ""
-
-
-def _load_contacted_domains() -> set[str]:
-    """Collect the set of domains that already have generated email sequences.
-
-    Loads all hunts once so the exclude-contacted check can run in O(1) per
-    candidate instead of reloading every hunt JSON per candidate.
-    """
-    from utils.storage import load_all_hunts  # local import to avoid cycles
-
-    domains: set[str] = set()
-    for hunt in load_all_hunts().values():
-        result = hunt.get("result") or {}
-        for sequence in (result.get("email_sequences") or []):
-            if not isinstance(sequence, dict):
-                continue
-            lead = sequence.get("lead") or {}
-            d = _filter_bare_domain(str(lead.get("website") or ""))
-            if d:
-                domains.add(d)
-    return domains
-
-
-def _lead_should_be_filtered(
-    lead: dict,
-    filters: dict | None,
-    contacted_domains: set[str] | None = None,
-) -> tuple[bool, str]:
-    """Apply a hunt's filter rules to a finalized lead candidate."""
-    if not isinstance(filters, dict):
-        return False, ""
-    try:
-        if bool(filters.get("use_blacklist", True)):
-            matched, reason = _blacklist_matches_lead(lead)
-            if matched:
-                return True, reason
-        if bool(filters.get("exclude_contacted", True)):
-            domain = _filter_bare_domain(str(lead.get("website") or ""))
-            if not domain:
-                return False, ""
-            if contacted_domains is not None:
-                if domain in contacted_domains:
-                    return True, "exclude_contacted"
-            elif storage_has_contacted_before(domain):
-                return True, "exclude_contacted"
-    except Exception as e:  # defensive — never block extraction
-        logger.warning("[LeadExtractAgent] filter check error (kept lead): %s", e)
-    return False, ""
-
-
 # ── ReAct system prompt for per-URL lead extraction ──────────────────────
 
 REACT_LEAD_SYSTEM = """You are a B2B lead research agent. Your goal: research a candidate company, extract company + contact info, find key decision makers, verify contact channels, collect concrete customs/trade data, score their fit, and output a structured JSON lead.
@@ -1021,12 +689,8 @@ def _build_react_tools(
         content = await _scrape_page(jina, url)
         if not content:
             return json.dumps({"error": "Failed to scrape page or page has no content", "url": url})
-        # 1.2 + B1: cap the history page entry at `head` chars (3000) and
-        # re-scan the FULL page for contacts so extract_lead_info downstream
-        # still sees emails/phones even when the body is trimmed. This stops
-        # the full page from being re-sent on every ReAct iteration (biggest
-        # single token waste) WITHOUT losing contact info.
-        compressed = _compress_scrape_for_history(content, head=3000)
+        # Truncate to avoid huge tool results
+        truncated = content[:6000]
         # Auto-extract contacts from the FULL content (not truncated)
         emails, phones, social = _extract_contacts_from_text(content)
         # Collect into the shared accumulator for post-hoc merge (P0-3)
@@ -1039,7 +703,7 @@ def _build_react_tools(
         # Discover contact page links
         contact_links = discover_contact_pages(content, url)
         result: dict[str, Any] = {
-            "content": compressed,
+            "content": truncated,
             "content_length": len(content),
             "extracted_emails": emails,
             "extracted_phones": phones,
@@ -1086,12 +750,7 @@ def _build_react_tools(
         """Use AI to extract structured company facts from page content (no scoring)."""
         if not page_content.strip():
             return json.dumps({"error": "page_content is required — pass the scraped text"})
-        prompt = f"## Page Content\n{page_content[:3500]}"
-        key = _hash(prompt)
-        if key in _extract_cache:
-            cache_stats["extract_hits"] += 1
-            logger.debug("[LeadExtract] extract cache HIT")
-            return _extract_cache[key]
+        prompt = f"## Page Content\n{page_content[:5000]}"
         try:
             raw = await llm.generate(
                 prompt,
@@ -1099,7 +758,6 @@ def _build_react_tools(
                 temperature=0.1,
                 response_format={"type": "json_object"},
             )
-            _extract_cache[key] = raw
             return raw
         except Exception as e:
             return json.dumps({"error": f"LLM extraction failed: {e}"})
@@ -1132,23 +790,34 @@ def _build_react_tools(
         """Score how well a company fits as a buyer/distributor using the full insight context."""
         if not company_profile.strip():
             return json.dumps({"error": "company_profile is required — pass the full extracted company JSON"})
-        # B3: lean seller context. The full insight is already in the ReAct
-        # user_prompt; re-injecting it all here wastes tokens on a *standalone*
-        # LLM call. Keep only what scoring strictly needs.
+        # Build rich seller context from insight
         products = ", ".join(insight.get("products", []))
+        industries = ", ".join(insight.get("industries", []))
+        value_props = "; ".join(insight.get("value_propositions", []))
         target_profile = insight.get("target_customer_profile", "B2B buyer")
         target_regions = ", ".join(insight.get("recommended_regions", []))
+        summary = insight.get("summary", "")
         negative_criteria = insight.get("negative_targeting_criteria", [])
         negative_text = "\n".join(f"- {c}" for c in negative_criteria) if negative_criteria else "None"
+        seller_name = insight.get("company_name", "Our Company")
+        # Derive preferred buyer types from target_customer_profile if available
         buyer_type_hint = "distributor, importer, wholesaler, agent, or reseller"
         if target_profile:
+            # Extract business type keywords from the ICP description
             icp_lower = target_profile.lower()
-            types = [t for t in ("distributor", "importer", "wholesale", "reseller", "retailer", "agent", "installer", "integrator") if t in icp_lower]
+            types = []
+            for t in ["distributor", "importer", "wholesaler", "reseller", "retailer", "agent", "installer", "integrator"]:
+                if t in icp_lower:
+                    types.append(t)
             if types:
                 buyer_type_hint = ", ".join(types)
         prompt = (
-            f"## Prospect Company Profile\n{company_profile[:2000]}\n\n"
-            f"## Products We Sell\n{products}\n\n"
+            f"## Prospect Company Profile\n{company_profile[:3000]}\n\n"
+            f"## Seller: {seller_name}\n"
+            f"Products: {products}\n"
+            f"Target industries: {industries}\n"
+            f"Value propositions: {value_props}\n"
+            f"Company summary: {summary}\n\n"
             f"## Ideal Customer Profile (ICP)\n{target_profile}\n\n"
             f"## Preferred Buyer Types\n{buyer_type_hint}\n\n"
             f"## Negative Criteria (Knockout)\n{negative_text}\n\n"
@@ -1156,13 +825,9 @@ def _build_react_tools(
             f"## Your Task\n"
             f"Score this prospect against the 4 dimensions. "
             f"For each fit_reason, cite SPECIFIC facts from the company profile above "
-            f"and explain WHY those facts make them a good match for our products ({products})."
+            f"(their actual products, location, business type, customer base) and explain "
+            f"WHY those facts make them a good match for {seller_name}'s products ({products})."
         )
-        key = _hash(prompt)
-        if key in _assess_cache:
-            cache_stats["assess_hits"] += 1
-            logger.debug("[LeadExtract] assess cache HIT")
-            return _assess_cache[key]
         try:
             raw = await llm.generate(
                 prompt,
@@ -1170,32 +835,10 @@ def _build_react_tools(
                 temperature=0.1,
                 response_format={"type": "json_object"},
             )
-            _assess_cache[key] = raw
             return raw
         except Exception as e:
             return json.dumps({"error": f"LLM assessment failed: {e}", "match_score": 0.3})
 
-    return _build_react_tool_defs(
-        tool_scrape_page,
-        tool_google_search,
-        tool_extract_lead_info,
-        tool_find_customs_data,
-        tool_assess_lead_fit,
-    )
-
-
-def _build_react_tool_defs(
-    tool_scrape_page,
-    tool_google_search,
-    tool_extract_lead_info,
-    tool_find_customs_data,
-    tool_assess_lead_fit,
-) -> list:
-    """Build the declarative ReAct tool list for lead extraction.
-
-    Extracted from ``_build_react_tools`` (which only wires the closures) so the
-    two concerns stay separate and the tool definitions can be read in one place.
-    """
     return [
         ToolDef(
             name="scrape_page",
@@ -1577,16 +1220,6 @@ async def lead_extract_node(state: HuntState) -> dict:
     }
     to_process = []
     seen_candidate_domains: set[str] = set(existing_domains)
-
-    # Cross-task crawl dedup: fold in domains already crawled by previous hunts
-    # so we don't re-fetch / re-run ReAct on the same company sites this hunt.
-    global_prior_domains: set[str] = set()
-    if getattr(settings, "global_crawl_dedup", True):
-        global_prior_domains = _global_crawled_domains_load()
-        if global_prior_domains:
-            seen_candidate_domains |= global_prior_domains
-
-    pre_skipped = 0
     for r in search_results:
         link = r.get("link", "")
         maps_title = (r.get("title") or (r.get("maps_data") or {}).get("title") or "").strip()
@@ -1596,7 +1229,6 @@ async def lead_extract_node(state: HuntState) -> dict:
         if link_official_domain and link_official_domain in existing_domains:
             continue
         if link_official_domain and link_official_domain in seen_candidate_domains:
-            pre_skipped += 1
             continue
         if link_official_domain:
             seen_candidate_domains.add(link_official_domain)
@@ -1607,19 +1239,6 @@ async def lead_extract_node(state: HuntState) -> dict:
         r for r in to_process
         if (not r.get("link")) or classify_url(r.get("link", "")) != "irrelevant"
     ]
-
-    # Record this hunt's actually-crawled domains into the global dedup store so
-    # future hunts skip them. Only genuinely-new (processable) domains are added.
-    if getattr(settings, "global_crawl_dedup", True) and processable:
-        _proc_domains = {
-            d for d in (_official_website_domain(r.get("link", "")) for r in processable) if d
-        }
-        if _proc_domains:
-            _global_crawled_domains_add(_proc_domains)
-            logger.info(
-                "[LeadExtractAgent] Global crawl dedup: %d prior domains, %d candidates pre-skipped, %d new domains recorded",
-                len(global_prior_domains), pre_skipped, len(_proc_domains),
-            )
 
     logger.info(
         "[LeadExtractAgent] %d URLs to process (%d irrelevant filtered out)",
@@ -1745,16 +1364,9 @@ async def lead_extract_node(state: HuntState) -> dict:
         await llm.close()
         await google.close()
 
-    # ── Collect valid leads, deduplicate + apply hunt filters ─────────────
+    # ── Collect valid leads, deduplicate ─────────────────────────────────
     new_leads = []
     seen_domains = set(existing_domains)
-    hunt_filters = state.get("filters")
-    hunt_filters = hunt_filters if isinstance(hunt_filters, dict) else None
-    contacted_domains: set[str] | None = None
-    if hunt_filters and hunt_filters.get("exclude_contacted", True):
-        contacted_domains = _load_contacted_domains()
-    filtered_out = 0
-    filter_reasons: dict[str, int] = {}
 
     for lead in results:
         if lead is None:
@@ -1764,22 +1376,7 @@ async def lead_extract_node(state: HuntState) -> dict:
             continue
         if official_domain:
             seen_domains.add(official_domain)
-        if hunt_filters:
-            dropped, reason = _lead_should_be_filtered(lead, hunt_filters, contacted_domains)
-            if dropped:
-                filtered_out += 1
-                filter_reasons[reason] = filter_reasons.get(reason, 0) + 1
-                continue
         new_leads.append(lead)
-
-    prior_filter_stats = state.get("filter_stats")
-    prior_filter_stats = prior_filter_stats if isinstance(prior_filter_stats, dict) else {}
-    merged_filter_stats = dict(prior_filter_stats)
-    merged_filter_stats["total_filtered"] = int(prior_filter_stats.get("total_filtered", 0)) + filtered_out
-    by_reason = dict(prior_filter_stats.get("by_reason") or {})
-    for reason, count in filter_reasons.items():
-        by_reason[reason] = int(by_reason.get(reason, 0)) + count
-    merged_filter_stats["by_reason"] = by_reason
 
     # ── Verify emails via MX record check (concurrent) ───────────────────
     # Remove emails whose domains have no MX records, indicating the domain
@@ -1801,6 +1398,5 @@ async def lead_extract_node(state: HuntState) -> dict:
     return {
         "leads": existing_leads + new_leads,
         "keyword_search_stats": keyword_stats,
-        "filter_stats": merged_filter_stats,
         "current_stage": "lead_extract",
     }

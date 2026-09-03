@@ -22,7 +22,7 @@ import litellm
 
 from config.settings import Settings, get_settings
 from tools.llm_errors import format_llm_error
-from tools.llm_client import _inject_api_keys, normalize_model_name, apply_tencent_transport
+from tools.llm_client import _inject_api_keys, normalize_model_name
 from tools.llm_rate_limiter import get_llm_rate_limiter
 
 logger = logging.getLogger(__name__)
@@ -44,9 +44,6 @@ async def _acompletion_with_rpm_limit(
         rpm = settings.email_reasoning_requests_per_minute or settings.reasoning_requests_per_minute or settings.llm_requests_per_minute
     else:
         rpm = settings.reasoning_requests_per_minute or settings.llm_requests_per_minute
-    # Tencent Hunyuan (TokenHub) virtual provider → OpenAI-compatible transport.
-    # Rewrites "tencent/<model>" so the ReAct reasoning loop can use Hy3 too.
-    apply_tencent_transport(settings, kwargs.get("model", ""), kwargs)
     await get_llm_rate_limiter(scope, rpm).acquire()
     return await litellm.acompletion(**kwargs)
 
@@ -197,254 +194,8 @@ def _record_react_cost(
                 cost_usd=float(cost),
                 hunt_round=hunt_round,
             )
-    except Exception as exc:
-        logger.debug("[react_runner] cost tracking skipped: %s", exc)
-
-
-async def _react_call(
-    *,
-    _settings: Settings,
-    model_scope: str,
-    model: str,
-    temperature: float,
-    max_tokens: int,
-    messages: list[dict[str, Any]],
-    tool_schemas: list[dict[str, Any]],
-    is_last: bool,
-    iteration: int,
-    hunt_id: str,
-    agent: str,
-    hunt_round: int,
-) -> tuple[Any, str | None]:
-    """Call the reasoning model once, with last-iteration fallback.
-
-    Returns ``(response, None)`` on success or ``(None, error_json)`` if the call
-    (and its stripped-history fallback) failed.
-    """
-    kwargs: dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    if tool_schemas:
-        kwargs["tools"] = tool_schemas
-        if is_last:
-            kwargs["tool_choice"] = "none"
-    try:
-        response = await _acompletion_with_rpm_limit(_settings, scope=model_scope, **kwargs)
-        _record_react_cost(response, hunt_id, agent, model, hunt_round)
-        return response, None
-    except Exception as e:
-        if is_last and tool_schemas:
-            logger.warning(
-                "[ReAct] Last-iteration call failed (%s), retrying with stripped tool history", e
-            )
-            try:
-                fallback_kwargs = {
-                    "model": model,
-                    "messages": _strip_tool_messages(messages),
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                }
-                response = await _acompletion_with_rpm_limit(_settings, scope=model_scope, **fallback_kwargs)
-                _record_react_cost(response, hunt_id, agent, model, hunt_round)
-                return response, None
-            except Exception as e2:
-                formatted = format_llm_error(e2)
-                logger.error("[ReAct] Fallback call also failed at iteration %d: %s", iteration, formatted)
-                return None, json.dumps({"error": f"ReAct LLM call failed: {formatted}"})
-        formatted = format_llm_error(e)
-        logger.error("[ReAct] LLM call failed at iteration %d: %s", iteration, formatted)
-        return None, json.dumps({"error": f"ReAct LLM call failed: {formatted}"})
-
-
-async def _react_execute_tools(
-    msg: Any,
-    tool_map: dict[str, Any],
-    messages: list[dict[str, Any]],
-) -> None:
-    """Execute all tool calls on a model message and append results to history."""
-    messages.append(msg.model_dump())
-    for tool_call in msg.tool_calls:
-        fn_name = tool_call.function.name
-        fn_args_raw = tool_call.function.arguments
-        try:
-            fn_args = json.loads(fn_args_raw) if fn_args_raw else {}
-        except json.JSONDecodeError:
-            fn_args = {}
-        tool_def = tool_map.get(fn_name)
-        if not tool_def:
-            result = json.dumps({"error": f"Unknown tool: {fn_name}"})
-        else:
-            try:
-                logger.debug("[ReAct] Calling tool %s(%s)", fn_name, fn_args)
-                result = await tool_def.fn(**fn_args)
-            except Exception as e:
-                logger.warning("[ReAct] Tool %s failed: %s", fn_name, e)
-                result = json.dumps({"error": f"Tool {fn_name} failed: {e}"})
-        messages.append({
-            "role": "tool",
-            "tool_call_id": tool_call.id,
-            "content": result,
-        })
-
-
-async def _react_nudge(
-    *,
-    _settings: Settings,
-    model_scope: str,
-    model: str,
-    temperature: float,
-    max_tokens: int,
-    nudge_messages: list[dict[str, Any]],
-    required_json_fields: list[str] | None,
-    hunt_id: str,
-    agent: str,
-    hunt_round: int,
-    fallback_content: str,
-) -> str:
-    """Run the JSON-recovery nudge sub-loop; fall back to ``fallback_content``."""
-    for nudge in range(_MAX_JSON_NUDGES):
-        try:
-            nudge_resp = await _acompletion_with_rpm_limit(
-                _settings,
-                scope=model_scope,
-                model=model,
-                messages=nudge_messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            _record_react_cost(nudge_resp, hunt_id, agent, model, hunt_round)
-            nudge_content = nudge_resp.choices[0].message.content or ""
-            nudge_parsed = _try_parse_json(nudge_content)
-            if nudge_parsed is not None and _has_required_fields(
-                nudge_parsed, required_json_fields or []
-            ):
-                logger.debug("[ReAct] Got valid JSON after nudge %d", nudge + 1)
-                return nudge_content
-            nudge_messages.append(nudge_resp.choices[0].message.model_dump())
-            nudge_messages.append({
-                "role": "user",
-                "content": "That is still not valid JSON. Output ONLY a raw JSON object starting with '{'. Nothing else.",
-            })
-            nudge_messages = _trim_messages(nudge_messages)
-        except Exception as e:
-            logger.warning("[ReAct] Nudge call failed: %s", format_llm_error(e))
-            break
-    logger.warning("[ReAct] Could not get JSON after %d nudges, returning raw", _MAX_JSON_NUDGES)
-    return fallback_content
-
-
-async def _react_handle_no_tool_calls(
-    *,
-    _settings: Settings,
-    model_scope: str,
-    model: str,
-    temperature: float,
-    max_tokens: int,
-    messages: list[dict[str, Any]],
-    msg: Any,
-    required_json_fields: list[str] | None,
-    hunt_id: str,
-    agent: str,
-    hunt_round: int,
-) -> str:
-    """Handle a model reply with no tool calls: validate JSON, nudge if needed.
-
-    A no-tool-calls iteration always terminates the loop — either it produced a
-    valid JSON answer, or we return the best content we have after nudging.
-    """
-    content = msg.content or ""
-    parsed = _try_parse_json(content)
-    if parsed is not None and _has_required_fields(parsed, required_json_fields or []):
-        logger.debug("[ReAct] Final answer (no tool calls)")
-        return content
-
-    if parsed is not None and not _has_required_fields(parsed, required_json_fields or []):
-        missing = [f for f in (required_json_fields or []) if f not in parsed]
-        nudge_reason = (
-            f"Your JSON is missing required fields: {missing}. "
-            f"Output a complete JSON object that includes ALL of these fields: "
-            f"{required_json_fields}. Output ONLY the JSON object."
-        )
-    else:
-        nudge_reason = (
-            "Your response is not valid JSON. You MUST output ONLY a raw JSON "
-            "object (starting with '{') with the lead information. "
-            "Do NOT include any explanation or tool call syntax. "
-            "Output ONLY the JSON object."
-        )
-
-    logger.debug("[ReAct] Non-JSON or incomplete, nudging")
-    messages.append(msg.model_dump())
-    messages.append({"role": "user", "content": nudge_reason})
-    messages = _trim_messages(messages)
-    nudge_messages = _strip_tool_messages(messages)
-    return await _react_nudge(
-        _settings=_settings,
-        model_scope=model_scope,
-        model=model,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        nudge_messages=nudge_messages,
-        required_json_fields=required_json_fields,
-        hunt_id=hunt_id,
-        agent=agent,
-        hunt_round=hunt_round,
-        fallback_content=content,
-    )
-
-
-async def _react_final_answer(
-    *,
-    _settings: Settings,
-    model_scope: str,
-    model: str,
-    temperature: float,
-    max_tokens: int,
-    messages: list[dict[str, Any]],
-    required_json_fields: list[str] | None,
-    hunt_id: str,
-    agent: str,
-    hunt_round: int,
-    content: str,
-) -> str:
-    """After max iterations, ask for the final JSON answer without tools."""
-    logger.warning("[ReAct] Max iterations reached, requesting final answer")
-    messages.append({
-        "role": "user",
-        "content": "STOP calling tools. Output your final JSON answer NOW based on everything gathered so far. Output ONLY a raw JSON object starting with '{'. Nothing else.",
-    })
-    final_messages = _strip_tool_messages(_trim_messages(messages))
-    for attempt in range(_MAX_JSON_NUDGES + 1):
-        try:
-            response = await _acompletion_with_rpm_limit(
-                _settings,
-                scope=model_scope,
-                model=model,
-                messages=final_messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            _record_react_cost(response, hunt_id, agent, model, hunt_round)
-            content = response.choices[0].message.content or ""
-            parsed = _try_parse_json(content)
-            if parsed is not None and _has_required_fields(parsed, required_json_fields or []):
-                return content
-            if attempt < _MAX_JSON_NUDGES:
-                final_messages.append(response.choices[0].message.model_dump())
-                final_messages.append({
-                    "role": "user",
-                    "content": "That is not valid JSON. Output ONLY a raw JSON object starting with '{'. Nothing else.",
-                })
-                final_messages = _trim_messages(final_messages)
-        except Exception as e:
-            formatted = format_llm_error(e)
-            logger.error("[ReAct] Final answer call failed: %s", formatted)
-            return json.dumps({"error": f"ReAct final answer failed: {formatted}"})
-    logger.warning("[ReAct] Could not get JSON final answer after retries")
-    return content
+    except Exception:
+        pass  # Never let tracking break the main flow
 
 
 async def react_loop(
@@ -493,7 +244,6 @@ async def react_loop(
     # Build tool schemas and lookup
     tool_schemas = [t.to_openai_schema() for t in tools]
     tool_map = {t.name: t for t in tools}
-    content = ""
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system},
@@ -505,6 +255,16 @@ async def react_loop(
 
         # On the last allowed iteration, don't offer tools — force a text answer
         is_last = iteration == max_iter
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if tool_schemas:
+            kwargs["tools"] = tool_schemas
+            if is_last:
+                kwargs["tool_choice"] = "none"
 
         # Inject budget warning when nearing the limit
         if iteration == max_iter - 1:
@@ -516,54 +276,176 @@ async def react_loop(
                 ),
             })
 
-        response, call_err = await _react_call(
-            _settings=_settings,
-            model_scope=model_scope,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            messages=messages,
-            tool_schemas=tool_schemas,
-            is_last=is_last,
-            iteration=iteration,
-            hunt_id=hunt_id,
-            agent=agent,
-            hunt_round=hunt_round,
-        )
-        if call_err is not None:
-            return call_err
+        try:
+            response = await _acompletion_with_rpm_limit(_settings, scope=model_scope, **kwargs)
+            _record_react_cost(response, hunt_id, agent, model, hunt_round)
+        except Exception as e:
+            # Fallback for last iteration: some Anthropic-compatible APIs (e.g. MiniMax)
+            # reject tool_choice="none" or tools= when history has tool_call messages.
+            # Retry with tool messages stripped and no tools= param.
+            if is_last and tool_schemas:
+                logger.warning(
+                    "[ReAct] Last-iteration call failed (%s), retrying with stripped tool history", e
+                )
+                try:
+                    fallback_kwargs = {
+                        "model": model,
+                        "messages": _strip_tool_messages(messages),
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                    }
+                    response = await _acompletion_with_rpm_limit(_settings, scope=model_scope, **fallback_kwargs)
+                    _record_react_cost(response, hunt_id, agent, model, hunt_round)
+                except Exception as e2:
+                    formatted = format_llm_error(e2)
+                    logger.error("[ReAct] Fallback call also failed at iteration %d: %s", iteration, formatted)
+                    return json.dumps({"error": f"ReAct LLM call failed: {formatted}"})
+            else:
+                formatted = format_llm_error(e)
+                logger.error("[ReAct] LLM call failed at iteration %d: %s", iteration, formatted)
+                return json.dumps({"error": f"ReAct LLM call failed: {formatted}"})
 
         choice = response.choices[0]
         msg = choice.message
 
-        # No tool calls → validate JSON and nudge if needed (always terminates).
+        # If no tool calls → check if it's a valid JSON final answer
         if not msg.tool_calls:
-            return await _react_handle_no_tool_calls(
-                _settings=_settings,
-                model_scope=model_scope,
+            content = msg.content or ""
+            parsed = _try_parse_json(content)
+
+            if parsed is not None and _has_required_fields(parsed, required_json_fields or []):
+                logger.debug("[ReAct] Final answer at iteration %d", iteration)
+                return json.dumps(parsed) if not isinstance(content, str) else content
+
+            # Determine nudge reason
+            if parsed is not None and not _has_required_fields(parsed, required_json_fields or []):
+                missing = [f for f in (required_json_fields or []) if f not in parsed]
+                nudge_reason = (
+                    f"Your JSON is missing required fields: {missing}. "
+                    f"Output a complete JSON object that includes ALL of these fields: "
+                    f"{required_json_fields}. Output ONLY the JSON object."
+                )
+            else:
+                nudge_reason = (
+                    "Your response is not valid JSON. You MUST output ONLY a raw JSON "
+                    "object (starting with '{') with the lead information. "
+                    "Do NOT include any explanation or tool call syntax. "
+                    "Output ONLY the JSON object."
+                )
+
+            # Model returned prose/thinking instead of JSON — nudge it
+            logger.debug("[ReAct] Non-JSON or incomplete at iteration %d, nudging", iteration)
+            messages.append(msg.model_dump())
+            messages.append({"role": "user", "content": nudge_reason})
+
+            # Trim messages if they've grown too large
+            messages = _trim_messages(messages)
+
+            # Nudge calls never pass tools= so strip tool-call messages from history
+            # to avoid Anthropic-compatible API errors (e.g. MiniMax)
+            nudge_messages = _strip_tool_messages(messages)
+
+            # Use a dedicated nudge sub-loop to avoid consuming main iterations
+            for nudge in range(_MAX_JSON_NUDGES):
+                try:
+                    nudge_resp = await _acompletion_with_rpm_limit(
+                        _settings,
+                        scope=model_scope,
+                        model=model,
+                        messages=nudge_messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+                    _record_react_cost(nudge_resp, hunt_id, agent, model, hunt_round)
+                    nudge_content = nudge_resp.choices[0].message.content or ""
+                    nudge_parsed = _try_parse_json(nudge_content)
+                    if nudge_parsed is not None and _has_required_fields(
+                        nudge_parsed, required_json_fields or []
+                    ):
+                        logger.debug("[ReAct] Got valid JSON after nudge %d", nudge + 1)
+                        return nudge_content
+                    # Still not valid — append and try once more
+                    nudge_messages.append(nudge_resp.choices[0].message.model_dump())
+                    nudge_messages.append({
+                        "role": "user",
+                        "content": "That is still not valid JSON. Output ONLY a raw JSON object starting with '{'. Nothing else.",
+                    })
+                    nudge_messages = _trim_messages(nudge_messages)
+                except Exception as e:
+                    logger.warning("[ReAct] Nudge call failed: %s", format_llm_error(e))
+                    break
+            # All nudges failed — return whatever we have
+            logger.warning("[ReAct] Could not get JSON after %d nudges, returning raw", _MAX_JSON_NUDGES)
+            return content
+
+        # Append assistant message with tool calls
+        messages.append(msg.model_dump())
+
+        # Execute each tool call
+        for tool_call in msg.tool_calls:
+            fn_name = tool_call.function.name
+            fn_args_raw = tool_call.function.arguments
+
+            try:
+                fn_args = json.loads(fn_args_raw) if fn_args_raw else {}
+            except json.JSONDecodeError:
+                fn_args = {}
+
+            tool_def = tool_map.get(fn_name)
+            if not tool_def:
+                result = json.dumps({"error": f"Unknown tool: {fn_name}"})
+            else:
+                try:
+                    logger.debug("[ReAct] Calling tool %s(%s)", fn_name, fn_args)
+                    result = await tool_def.fn(**fn_args)
+                except Exception as e:
+                    logger.warning("[ReAct] Tool %s failed: %s", fn_name, e)
+                    result = json.dumps({"error": f"Tool {fn_name} failed: {e}"})
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": result,
+            })
+
+    # Exhausted iterations — ask for final answer without tools
+    logger.warning("[ReAct] Max iterations (%d) reached, requesting final answer", max_iter)
+    messages.append({
+        "role": "user",
+        "content": "STOP calling tools. Output your final JSON answer NOW based on everything gathered so far. Output ONLY a raw JSON object starting with '{'. Nothing else.",
+    })
+
+    # Trim and strip tool messages — final answer calls never pass tools=
+    final_messages = _strip_tool_messages(_trim_messages(messages))
+
+    for attempt in range(_MAX_JSON_NUDGES + 1):
+        try:
+            response = await _acompletion_with_rpm_limit(
+                _settings,
+                scope=model_scope,
                 model=model,
+                messages=final_messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                messages=messages,
-                msg=msg,
-                required_json_fields=required_json_fields,
-                hunt_id=hunt_id,
-                agent=agent,
-                hunt_round=hunt_round,
             )
+            _record_react_cost(response, hunt_id, agent, model, hunt_round)
+            content = response.choices[0].message.content or ""
+            parsed = _try_parse_json(content)
+            if parsed is not None and _has_required_fields(
+                parsed, required_json_fields or []
+            ):
+                return content
+            if attempt < _MAX_JSON_NUDGES:
+                final_messages.append(response.choices[0].message.model_dump())
+                final_messages.append({
+                    "role": "user",
+                    "content": "That is not valid JSON. Output ONLY a raw JSON object starting with '{'. Nothing else.",
+                })
+                final_messages = _trim_messages(final_messages)
+        except Exception as e:
+            formatted = format_llm_error(e)
+            logger.error("[ReAct] Final answer call failed: %s", formatted)
+            return json.dumps({"error": f"ReAct final answer failed: {formatted}"})
 
-        await _react_execute_tools(msg, tool_map, messages)
-
-    return await _react_final_answer(
-        _settings=_settings,
-        model_scope=model_scope,
-        model=model,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        messages=messages,
-        required_json_fields=required_json_fields,
-        hunt_id=hunt_id,
-        agent=agent,
-        hunt_round=hunt_round,
-        content=content,
-    )
+    logger.warning("[ReAct] Could not get JSON final answer after retries")
+    return content

@@ -7,7 +7,6 @@ import logging
 from typing import Optional
 
 from config.settings import Settings, get_settings
-from tools.search_retry import retry_search
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +66,6 @@ class TavilySearchTool:
         if gl:
             effective_query = f"{query} site:.{gl}" if len(gl) == 2 else query
 
-        @retry_search
         def _sync_search():
             return client.search(
                 query=effective_query,

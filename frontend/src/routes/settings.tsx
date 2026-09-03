@@ -13,15 +13,11 @@ import {
   RefreshCw,
   ChevronDown,
   Check,
-  ShieldAlert,
-  Trash2,
-  Plus,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Badge } from "@/components/ui/badge";
-import { api, Blacklist } from "@/api/client";
+import { api } from "@/api/client";
 import {
   Card,
   CardContent,
@@ -98,58 +94,27 @@ const PROVIDERS: Provider[] = [
   },
   {
     id: "glm",
-    label: "GLM / 智谱 Z.AI",
+    label: "GLM / Z.AI",
     apiKeyField: "zai_api_key",
     apiKeyPlaceholder: "",
-    defaultModels: ["zai/glm-4.6", "zai/glm-4.5-air", "zai/glm-4.7-flash"],
-    reasoningModels: ["zai/glm-4.7", "zai/glm-5.1"],
+    defaultModels: ["openai/glm-4-flash", "openai/glm-4-air"],
+    reasoningModels: ["openai/glm-4", "openai/glm-z1-airx"],
   },
   {
     id: "kimi",
     label: "Kimi (Moonshot)",
     apiKeyField: "moonshot_api_key",
     apiKeyPlaceholder: "",
-    defaultModels: ["moonshot/kimi-latest-8k", "moonshot/kimi-latest-32k"],
-    reasoningModels: ["moonshot/kimi-k2-thinking", "moonshot/kimi-latest-128k"],
+    defaultModels: ["openai/moonshot-v1-8k", "openai/moonshot-v1-32k"],
+    reasoningModels: ["openai/moonshot-v1-128k", "openai/kimi-k1-5"],
   },
   {
     id: "minimax",
     label: "MiniMax",
     apiKeyField: "minimax_api_key",
     apiKeyPlaceholder: "",
-    defaultModels: ["minimax/MiniMax-Text-01"],
-    reasoningModels: ["minimax/MiniMax-Text-01"],
-  },
-  {
-    id: "dashscope",
-    label: "阿里云百炼 (DashScope / 通义千问)",
-    apiKeyField: "dashscope_api_key",
-    apiKeyPlaceholder: "sk-…",
-    defaultModels: [
-      "dashscope/qwen-turbo",
-      "dashscope/qwen-plus",
-      "dashscope/qwen-plus-latest",
-    ],
-    reasoningModels: ["dashscope/qwen-max", "dashscope/qwen-plus"],
-  },
-  {
-    id: "deepseek",
-    label: "DeepSeek 官方",
-    apiKeyField: "deepseek_api_key",
-    apiKeyPlaceholder: "sk-…",
-    defaultModels: ["deepseek/deepseek-chat"],
-    reasoningModels: ["deepseek/deepseek-reasoner"],
-  },
-  {
-    id: "volcengine",
-    label: "火山方舟 (豆包)",
-    apiKeyField: "volcengine_api_key",
-    apiKeyPlaceholder: "",
-    defaultModels: [
-      "volcengine/doubao-seed-2-0-lite-260215",
-      "volcengine/doubao-seed-2-0-pro-260215",
-    ],
-    reasoningModels: ["volcengine/doubao-seed-2-0-pro-260215"],
+    defaultModels: ["openai/MiniMax-Text-01"],
+    reasoningModels: ["openai/MiniMax-Text-01"],
   },
 ];
 
@@ -161,9 +126,6 @@ const MAIN_API_KEY_FIELDS: Record<string, string> = {
   glm: "zai_api_key",
   kimi: "moonshot_api_key",
   minimax: "minimax_api_key",
-  dashscope: "dashscope_api_key",
-  deepseek: "deepseek_api_key",
-  volcengine: "volcengine_api_key",
 };
 
 const EMAIL_API_KEY_FIELDS: Record<string, string> = {
@@ -174,9 +136,6 @@ const EMAIL_API_KEY_FIELDS: Record<string, string> = {
   glm: "email_zai_api_key",
   kimi: "email_moonshot_api_key",
   minimax: "email_minimax_api_key",
-  dashscope: "email_dashscope_api_key",
-  deepseek: "email_deepseek_api_key",
-  volcengine: "email_volcengine_api_key",
 };
 
 // ── Helpers to detect provider from a model string ───────────────────────────
@@ -186,15 +145,7 @@ function detectProvider(model: string): string {
   if (model.startsWith("anthropic/")) return "anthropic";
   if (model.startsWith("openrouter/")) return "openrouter";
   if (model.startsWith("groq/")) return "groq";
-  // 原生 provider 前缀（当前推荐写法）
-  if (model.startsWith("dashscope/")) return "dashscope";
-  if (model.startsWith("deepseek/")) return "deepseek";
-  if (model.startsWith("volcengine/")) return "volcengine";
-  if (model.startsWith("zai/")) return "glm";
-  if (model.startsWith("moonshot/")) return "kimi";
-  if (model.startsWith("minimax/")) return "minimax";
-  // 兼容旧配置：早期用 openai/ 前缀指向国内厂商
-  if (model.startsWith("openai/glm")) return "glm";
+  if (model.startsWith("openai/glm") || model.startsWith("openai/glm")) return "glm";
   if (model.startsWith("openai/moonshot") || model.startsWith("openai/kimi")) return "kimi";
   if (model.startsWith("openai/MiniMax")) return "minimax";
   return "openai";
@@ -227,8 +178,6 @@ function SecretInput({
       <button
         type="button"
         onClick={() => setShow((s) => !s)}
-        aria-label={show ? "隐藏密钥" : "显示密钥"}
-        aria-pressed={show}
         className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
       >
         {show ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
@@ -1184,167 +1133,6 @@ function AutomationNotifyPanel({
   );
 }
 
-// ── Blacklist management panel ─────────────────────────────────────────────
-function BlacklistPanel() {
-  const queryClient = useQueryClient();
-  const [type, setType] = useState<"domain" | "keyword">("domain");
-  const [value, setValue] = useState("");
-  const [note, setNote] = useState("");
-  const [batchText, setBatchText] = useState("");
-  const [error, setError] = useState("");
-
-  const { data } = useQuery({
-    queryKey: ["blacklists"],
-    queryFn: api.listBlacklists,
-    retry: false,
-  });
-  const items = data?.items ?? [];
-
-  const addMutation = useMutation({
-    mutationFn: (payload: { type: "domain" | "keyword"; value: string; note: string }) =>
-      api.createBlacklist(payload),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["blacklists"] });
-      setValue("");
-      setNote("");
-    },
-  });
-
-  const batchMutation = useMutation({
-    mutationFn: (items: { type: "domain" | "keyword"; value: string }[]) =>
-      api.createBlacklistsBatch(items),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["blacklists"] });
-      setBatchText("");
-    },
-  });
-
-  const deleteMutation = useMutation({
-    mutationFn: (itemId: string) => api.deleteBlacklist(itemId),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["blacklists"] }),
-  });
-
-  const handleAdd = () => {
-    setError("");
-    if (!value.trim()) {
-      setError("请填写黑名单值");
-      return;
-    }
-    addMutation.mutate({ type, value: value.trim(), note: note.trim() });
-  };
-
-  const handleBatch = () => {
-    setError("");
-    // 每行一条；支持 "type,value" 或纯 value（默认按当前 type）
-    const lines = batchText.split(/\n/).map((l) => l.trim()).filter(Boolean);
-    if (!lines.length) {
-      setError("请粘贴至少一条");
-      return;
-    }
-    const parsed = lines.map((line) => {
-      const parts = line.split(/[,，\t]/).map((s) => s.trim()).filter(Boolean);
-      if (parts.length >= 2 && (parts[0] === "domain" || parts[0] === "keyword")) {
-        return { type: parts[0] as "domain" | "keyword", value: parts[1] };
-      }
-      return { type, value: line };
-    });
-    batchMutation.mutate(parsed);
-  };
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <ShieldAlert className="h-5 w-5 text-primary" />
-          黑名单过滤
-        </CardTitle>
-        <CardDescription>命中黑名单的域名/关键词会在挖掘时被排除</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-5">
-        {/* 单条添加 */}
-        <div className="space-y-3">
-          <div className="flex flex-wrap items-end gap-3">
-            <div className="space-y-1.5">
-              <Label>类型</Label>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => setType("domain")}
-                  className={`rounded-md border px-3 py-1.5 text-sm ${type === "domain" ? "border-primary bg-primary/10 text-primary" : "text-muted-foreground"}`}
-                >
-                  域名
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setType("keyword")}
-                  className={`rounded-md border px-3 py-1.5 text-sm ${type === "keyword" ? "border-primary bg-primary/10 text-primary" : "text-muted-foreground"}`}
-                >
-                  关键词
-                </button>
-              </div>
-            </div>
-            <div className="flex-1 min-w-[180px] space-y-1.5">
-              <Label>值</Label>
-              <Input placeholder={type === "domain" ? "example.com" : "free"} value={value} onChange={(e) => setValue(e.target.value)} />
-            </div>
-            <div className="flex-1 min-w-[140px] space-y-1.5">
-              <Label>备注（可选）</Label>
-              <Input placeholder="原因" value={note} onChange={(e) => setNote(e.target.value)} />
-            </div>
-            <Button onClick={handleAdd} disabled={addMutation.isPending}>
-              {addMutation.isPending ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Plus className="h-4 w-4 mr-2" />}
-              添加
-            </Button>
-          </div>
-        </div>
-
-        {/* 批量导入 */}
-        <div className="space-y-2">
-          <Label>批量导入（每行一条；可选 "域名,值" 格式）</Label>
-          <textarea
-            className="min-h-[90px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            placeholder={"evilcorp.com\ncompetitor.net\nkeyword, free shipping"}
-            value={batchText}
-            onChange={(e) => setBatchText(e.target.value)}
-          />
-          <Button variant="outline" onClick={handleBatch} disabled={batchMutation.isPending}>
-            {batchMutation.isPending ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Plus className="h-4 w-4 mr-2" />}
-            批量导入
-          </Button>
-        </div>
-
-        {error && <p className="text-sm text-destructive">{error}</p>}
-
-        {/* 列表 */}
-        {items.length > 0 ? (
-          <div className="space-y-2">
-            {items.map((item: Blacklist) => (
-              <div key={item.id} className="flex items-center gap-3 rounded-md border px-3 py-2 text-sm">
-                <Badge variant={item.type === "domain" ? "secondary" : "outline"}>
-                  {item.type === "domain" ? "域名" : "关键词"}
-                </Badge>
-                <span className="flex-1 truncate font-mono text-xs">{item.value}</span>
-                {item.note && <span className="text-xs text-muted-foreground truncate max-w-[180px]">{item.note}</span>}
-                <button
-                  type="button"
-                  className="text-muted-foreground hover:text-destructive"
-                  title="删除"
-                  disabled={deleteMutation.isPending}
-                  onClick={() => deleteMutation.mutate(item.id)}
-                >
-                  <Trash2 className="h-4 w-4" />
-                </button>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <p className="text-sm text-muted-foreground">暂无黑名单条目</p>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
 // ── Main Settings Page ────────────────────────────────────────────────────────
 
 export function SettingsPage() {
@@ -1372,9 +1160,6 @@ export function SettingsPage() {
         ZAI_API_KEY: "zai_api_key",
         MOONSHOT_API_KEY: "moonshot_api_key",
         MINIMAX_API_KEY: "minimax_api_key",
-        DASHSCOPE_API_KEY: "dashscope_api_key",
-        DEEPSEEK_API_KEY: "deepseek_api_key",
-        VOLCENGINE_API_KEY: "volcengine_api_key",
         EMAIL_OPENAI_API_KEY: "email_openai_api_key",
         EMAIL_ANTHROPIC_API_KEY: "email_anthropic_api_key",
         EMAIL_OPENROUTER_API_KEY: "email_openrouter_api_key",
@@ -1382,9 +1167,6 @@ export function SettingsPage() {
         EMAIL_ZAI_API_KEY: "email_zai_api_key",
         EMAIL_MOONSHOT_API_KEY: "email_moonshot_api_key",
         EMAIL_MINIMAX_API_KEY: "email_minimax_api_key",
-        EMAIL_DASHSCOPE_API_KEY: "email_dashscope_api_key",
-        EMAIL_DEEPSEEK_API_KEY: "email_deepseek_api_key",
-        EMAIL_VOLCENGINE_API_KEY: "email_volcengine_api_key",
         SERPER_API_KEY: "serper_api_key",
         TAVILY_API_KEY: "tavily_api_key",
         JINA_API_KEY: "jina_api_key",
@@ -1435,8 +1217,7 @@ export function SettingsPage() {
     onSuccess: () => {
       setSaved(true);
       queryClient.invalidateQueries({ queryKey: ["app-settings"] });
-      const timer = setTimeout(() => setSaved(false), 3000);
-      return () => clearTimeout(timer);
+      setTimeout(() => setSaved(false), 3000);
     },
   });
 
@@ -1454,16 +1235,7 @@ export function SettingsPage() {
   };
 
   const handleSave = () => {
-    // The backend returns masked placeholders (e.g. "sk-a****wxyz") for secret
-    // fields. Save forms are submitted wholesale, so sending a masked value back
-    // would overwrite the real secret with the literal string "****".
-    // Drop every untouched masked field and let the backend keep the stored one.
-    const cleaned: Record<string, string> = {};
-    for (const [key, value] of Object.entries(values)) {
-      if (typeof value === "string" && value.includes("****")) continue;
-      cleaned[key] = value;
-    }
-    saveMutation.mutate(cleaned);
+    saveMutation.mutate(values);
   };
 
   const persistSettings = async (payload: Record<string, string>) => {
@@ -1540,9 +1312,6 @@ export function SettingsPage() {
         values={values}
         onChange={handleChange}
       />
-
-      {/* Blacklist */}
-      <BlacklistPanel />
 
       <div className="flex justify-end pb-8">
         <Button onClick={handleSave} disabled={saveMutation.isPending} size="lg">

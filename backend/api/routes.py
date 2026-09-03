@@ -6,8 +6,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import re
-import time
 import uuid
 from pathlib import Path
 from datetime import datetime, timezone
@@ -31,15 +29,6 @@ from tools.llm_client import LLMTool
 from emailing.smtp_client import send_smtp_email
 from api.hunt_store import load_all_hunts, save_hunt, now_iso
 from api.security import require_api_access
-from api.errors import safe_error_detail
-from utils.storage import (
-    get_blacklists, save_blacklist, delete_blacklist,
-    get_portraits, save_portrait, delete_portrait, get_portrait_by_id,
-    get_leads, find_lead, update_lead, make_lead_key,
-)
-from services.portrait_service import PortraitService
-from services.portrait_builder import build_portrait, start_hunt_from_portrait
-from tools.social_enrich import SocialEnricher
 from graph.builder import build_graph
 from graph.evaluate import evaluate_progress, should_continue_hunting, _build_keyword_performance
 from observability.cost_tracker import get_tracker, remove_tracker
@@ -52,12 +41,6 @@ _hunts: dict[str, dict] = load_all_hunts(mark_interrupted=True)
 # SSE event queues per hunt — subscribers listen here
 _sse_queues: dict[str, list[asyncio.Queue]] = {}
 _reply_detection_task: asyncio.Task[Any] | None = None
-
-# Throttle for incremental lead persistence: lead_extract can emit many leads
-# per second and save_hunt rewrites the whole hunt JSON on every call. Flush at
-# most once per interval; authoritative state is still checkpointed at stage
-# changes and fully flushed at hunt end, so this only bounds the kill-9 window.
-_LEAD_SAVE_INTERVAL_SECONDS = 2.0
 
 
 class HuntCancelledError(RuntimeError):
@@ -106,33 +89,6 @@ def _unique_leads_count(leads: list[dict[str, Any]]) -> int:
     return len(_dedupe_leads(leads))
 
 
-def _on_lead_progress(hunt_id: str, throttle_state: dict, data: dict) -> None:
-    """SSE-broadcast and incrementally persist a lead-found progress event.
-
-    Shared by both ``_run_hunt`` and ``_run_resume_hunt`` — previously this
-    18-line block was duplicated verbatim in both, which risks the two copies
-    drifting apart.
-
-    Incrementally persisting leads survives ``kill -9``. The write is throttled
-    because ``save_hunt`` rewrites the whole hunt JSON: flush at most once per
-    ``_LEAD_SAVE_INTERVAL_SECONDS`` (authoritative state is still checkpointed
-    at stage changes and fully flushed at hunt end).
-    """
-    _broadcast(hunt_id, "lead_progress", data)
-    if data.get("event") == "lead_found" and data.get("lead"):
-        hunt = _hunts.get(hunt_id)
-        if hunt is not None:
-            result = hunt.setdefault("result", {})
-            leads = result.setdefault("leads", [])
-            leads.append(data["lead"])
-            hunt["leads_count"] = _unique_leads_count(leads)
-            now = time.monotonic()
-            if now - throttle_state["last_save"] >= _LEAD_SAVE_INTERVAL_SECONDS:
-                if not save_hunt(hunt_id, hunt):
-                    logger.error("[Hunt %s] Failed to persist incremental leads", hunt_id[:8])
-                throttle_state["last_save"] = now
-
-
 def _validate_uploaded_file_ids(file_ids: list[str]) -> list[str]:
     """Accept only files that exist under the managed upload directory."""
     if not file_ids:
@@ -168,10 +124,6 @@ class HuntRequest(BaseModel):
     email_template_examples: list[str] = Field(default_factory=list, description="Optional historical outreach emails or template samples from the user")
     email_template_notes: str = Field(default="", description="Optional notes about preferred style, offer, or constraints")
     template_seed: dict[str, Any] | None = None
-    mode: str = Field(default="forward", description="'forward' | 'reverse' | 'hybrid'")
-    competitors: list[str] = Field(default_factory=list)
-    reverse_templates: list[str] = Field(default_factory=list)
-    filters: dict[str, Any] | None = None
 
 
 class ResumeRequest(BaseModel):
@@ -615,9 +567,19 @@ def _broadcast_stage_data(hunt_id: str, completed_stage: str, state: dict) -> No
 
 # ── Background task runner ──────────────────────────────────────────────
 
-def _build_initial_state(request: HuntRequest, hunt_id: str) -> dict[str, Any]:
-    """Construct the initial LangGraph state dict for a hunt."""
-    return {
+async def _run_hunt(hunt_id: str, request: HuntRequest) -> None:
+    """Run the full hunt pipeline in the background."""
+    _hunts[hunt_id]["status"] = "running"
+    logger.info(
+        "[Hunt %s] Starting — url=%s, files=%d, desc=%r, keywords=%s, profile=%s, regions=%s, email=%s",
+        hunt_id[:8], request.website_url or "(none)",
+        len(request.uploaded_file_ids),
+        request.description[:60] if request.description else "",
+        request.product_keywords, request.target_customer_profile,
+        request.target_regions, request.enable_email_craft,
+    )
+
+    initial_state = {
         "website_url": request.website_url,
         "description": request.description,
         "product_keywords": request.product_keywords,
@@ -631,11 +593,6 @@ def _build_initial_state(request: HuntRequest, hunt_id: str) -> dict[str, Any]:
         "email_template_examples": list(request.email_template_examples),
         "email_template_notes": request.email_template_notes,
         "template_seed": request.template_seed or None,
-        "mode": request.mode,
-        "competitors": list(request.competitors),
-        "reverse_templates": list(request.reverse_templates),
-        "filters": request.filters,
-        "filter_stats": {},
         "insight": None,
         "keywords": [],
         "used_keywords": [],
@@ -653,118 +610,20 @@ def _build_initial_state(request: HuntRequest, hunt_id: str) -> dict[str, Any]:
         "messages": [],
     }
 
-
-def _apply_hunt_chunk(hunt_id: str, chunk: dict, accumulated: dict, prev: dict) -> None:
-    """Merge one LangGraph stream chunk into ``accumulated`` and broadcast updates.
-
-    ``prev`` is a mutable ``{"stage": str, "round": int}`` carrying cross-chunk
-    stage/round state across the stream.
-    """
-    for node_name, node_output in chunk.items():
-        if node_name == "__end__":
-            continue
-
-        accumulated.update(node_output)
-
-        stage = node_output.get("current_stage", prev["stage"])
-        hunt_round = accumulated.get("hunt_round", prev["round"])
-        leads_count = _unique_leads_count(accumulated.get("leads", []))
-        email_count = len(accumulated.get("email_sequences", []))
-
-        _hunts[hunt_id].update({
-            "current_stage": stage,
-            "hunt_round": hunt_round,
-            "leads_count": leads_count,
-            "email_sequences_count": email_count,
-        })
-
-        if stage != prev["stage"]:
-            logger.info("[Hunt %s] Stage: %s → %s (round %d, leads %d)",
-                        hunt_id[:8], prev["stage"], stage, hunt_round, leads_count)
-            _broadcast(hunt_id, "stage_change", {
-                "stage": stage,
-                "hunt_round": hunt_round,
-                "leads_count": leads_count,
-            })
-
-            # Broadcast detail data for the stage that just completed
-            _broadcast_stage_data(hunt_id, prev["stage"], accumulated)
-
-            # Checkpoint: persist accumulated state so kill -9 doesn't lose data
-            _hunts[hunt_id]["result"] = dict(accumulated)
-            save_hunt(hunt_id, _hunts[hunt_id])
-
-            prev["stage"] = stage
-
-        if hunt_round != prev["round"]:
-            logger.info("[Hunt %s] Round %d → %d", hunt_id[:8], prev["round"], hunt_round)
-            _broadcast(hunt_id, "round_change", {"hunt_round": hunt_round})
-            prev["round"] = hunt_round
-
-        _broadcast(hunt_id, "progress", {
-            "leads_count": leads_count,
-            "email_sequences_count": email_count,
-            "hunt_round": hunt_round,
-            "stage": stage,
-        })
-
-
-def _finalize_hunt(hunt_id: str, accumulated: dict, status: str, *, error: str | None = None) -> None:
-    """Persist a hunt's final state and broadcast completion/failure.
-
-    Unifies the previously near-duplicated completed / cancelled / failed paths.
-    For non-completed statuses the in-memory ``current_stage`` is left untouched.
-    """
-    cost_summary = get_tracker(hunt_id).to_summary()
-    remove_tracker(hunt_id)
-    accumulated["cost_summary"] = cost_summary
-
-    update: dict[str, Any] = {
-        "status": status,
-        "error": error,
-        "completed_at": now_iso(),
-        "cost_summary": cost_summary,
-        "result": accumulated,
-        "leads_count": _unique_leads_count(accumulated.get("leads", [])),
-        "hunt_round": accumulated.get("hunt_round", 0),
-    }
-    if status == "completed":
-        update["current_stage"] = accumulated.get("current_stage", "done")
-
-    _hunts[hunt_id].update(update)
-    save_hunt(hunt_id, _hunts[hunt_id])
-
-    if status == "completed":
-        _broadcast(hunt_id, "completed", {
-            "leads_count": _unique_leads_count(accumulated.get("leads", [])),
-            "email_sequences_count": len(accumulated.get("email_sequences", [])),
-            "hunt_round": accumulated.get("hunt_round", 0),
-        })
-    else:
-        _broadcast(hunt_id, "failed", {"error": error or ""})
-
-
-async def _run_hunt(hunt_id: str, request: HuntRequest) -> None:
-    """Run the full hunt pipeline in the background."""
-    _hunts[hunt_id]["status"] = "running"
-    logger.info(
-        "[Hunt %s] Starting — url=%s, files=%d, desc=%r, keywords=%s, profile=%s, regions=%s, email=%s",
-        hunt_id[:8], request.website_url or "(none)",
-        len(request.uploaded_file_ids),
-        request.description[:60] if request.description else "",
-        request.product_keywords, request.target_customer_profile,
-        request.target_regions, request.enable_email_craft,
-    )
-
-    initial_state = _build_initial_state(request, hunt_id)
-
     # Wire per-URL progress callback → SSE broadcast + incremental disk save
-    _throttle_state = {"last_save": 0.0}
-    set_progress_callback(lambda data: _on_lead_progress(hunt_id, _throttle_state, data))
+    def _on_lead_progress(data: dict) -> None:
+        _broadcast(hunt_id, "lead_progress", data)
+        # Incrementally persist each lead as it's found — survives kill -9
+        if data.get("event") == "lead_found" and data.get("lead"):
+            hunt = _hunts.get(hunt_id)
+            if hunt is not None:
+                result = hunt.setdefault("result", {})
+                leads = result.setdefault("leads", [])
+                leads.append(data["lead"])
+                hunt["leads_count"] = _unique_leads_count(leads)
+                save_hunt(hunt_id, hunt)
 
-    # Initialize accumulated BEFORE the try block so exception handlers
-    # (cancel / failure paths) can always reference it safely.
-    accumulated: dict[str, Any] = dict(initial_state)
+    set_progress_callback(_on_lead_progress)
 
     try:
         _raise_if_hunt_cancelled(hunt_id)
@@ -779,24 +638,130 @@ async def _run_hunt(hunt_id: str, request: HuntRequest) -> None:
             email_craft_node=email_craft_node,
         )
 
-        prev = {"stage": "start", "round": 1}
+        # Use astream to get intermediate state updates and accumulate final result
+        prev_stage = "start"
+        prev_round = 1
+        accumulated: dict[str, Any] = dict(initial_state)
+
         async for chunk in graph.astream(initial_state):
             _raise_if_hunt_cancelled(hunt_id)
-            _apply_hunt_chunk(hunt_id, chunk, accumulated, prev)
-            _raise_if_hunt_cancelled(hunt_id)
+            # chunk is {node_name: node_output_dict}
+            for node_name, node_output in chunk.items():
+                if node_name == "__end__":
+                    continue
 
-        _finalize_hunt(hunt_id, accumulated, "completed")
+                # Merge node output into accumulated state
+                accumulated.update(node_output)
+
+                stage = node_output.get("current_stage", prev_stage)
+                hunt_round = accumulated.get("hunt_round", prev_round)
+                leads_count = _unique_leads_count(accumulated.get("leads", []))
+                email_count = len(accumulated.get("email_sequences", []))
+
+                # Update in-memory store
+                _hunts[hunt_id].update({
+                    "current_stage": stage,
+                    "hunt_round": hunt_round,
+                    "leads_count": leads_count,
+                    "email_sequences_count": email_count,
+                })
+
+                # Broadcast stage change + stage-specific detail data
+                if stage != prev_stage:
+                    logger.info("[Hunt %s] Stage: %s → %s (round %d, leads %d)",
+                                hunt_id[:8], prev_stage, stage, hunt_round, leads_count)
+                    _broadcast(hunt_id, "stage_change", {
+                        "stage": stage,
+                        "hunt_round": hunt_round,
+                        "leads_count": leads_count,
+                    })
+
+                    # Broadcast detail data for the stage that just completed
+                    _broadcast_stage_data(hunt_id, prev_stage, accumulated)
+
+                    # Checkpoint: persist accumulated state so kill -9 doesn't lose data
+                    _hunts[hunt_id]["result"] = dict(accumulated)
+                    save_hunt(hunt_id, _hunts[hunt_id])
+
+                    prev_stage = stage
+
+                # Broadcast round change
+                if hunt_round != prev_round:
+                    logger.info("[Hunt %s] Round %d → %d", hunt_id[:8], prev_round, hunt_round)
+                    _broadcast(hunt_id, "round_change", {
+                        "hunt_round": hunt_round,
+                    })
+                    prev_round = hunt_round
+
+                # Broadcast progress
+                _broadcast(hunt_id, "progress", {
+                    "leads_count": leads_count,
+                    "email_sequences_count": email_count,
+                    "hunt_round": hunt_round,
+                    "stage": stage,
+                })
+                _raise_if_hunt_cancelled(hunt_id)
+
+        # Stream finished — accumulated has the full merged state
+        cost_summary = get_tracker(hunt_id).to_summary()
+        remove_tracker(hunt_id)
+        accumulated["cost_summary"] = cost_summary
+
+        _hunts[hunt_id].update({
+            "status": "completed",
+            "result": accumulated,
+            "current_stage": accumulated.get("current_stage", "done"),
+            "hunt_round": accumulated.get("hunt_round", 0),
+            "leads_count": _unique_leads_count(accumulated.get("leads", [])),
+            "email_sequences_count": len(accumulated.get("email_sequences", [])),
+            "completed_at": now_iso(),
+            "cost_summary": cost_summary,
+        })
+        save_hunt(hunt_id, _hunts[hunt_id])
+
         logger.info("[Hunt %s] Completed — %d leads, %d email sequences, %d rounds",
                     hunt_id[:8], _unique_leads_count(accumulated.get("leads", [])),
                     len(accumulated.get("email_sequences", [])),
                     accumulated.get("hunt_round", 0))
 
+        _broadcast(hunt_id, "completed", {
+            "leads_count": _unique_leads_count(accumulated.get("leads", [])),
+            "email_sequences_count": len(accumulated.get("email_sequences", [])),
+            "hunt_round": accumulated.get("hunt_round", 0),
+        })
+
     except HuntCancelledError as e:
         logger.warning("[Hunt %s] Cancelled: %s", hunt_id[:8], e)
-        _finalize_hunt(hunt_id, accumulated, "cancelled", error=str(e))
+        cost_summary = get_tracker(hunt_id).to_summary()
+        remove_tracker(hunt_id)
+        accumulated["cost_summary"] = cost_summary
+        _hunts[hunt_id].update({
+            "status": "cancelled",
+            "error": str(e),
+            "completed_at": now_iso(),
+            "cost_summary": cost_summary,
+            "result": accumulated,
+            "leads_count": _unique_leads_count(accumulated.get("leads", [])),
+            "hunt_round": accumulated.get("hunt_round", 0),
+        })
+        save_hunt(hunt_id, _hunts[hunt_id])
+        _broadcast(hunt_id, "failed", {"error": str(e)})
     except Exception as e:
         logger.error("[Hunt %s] Failed: %s", hunt_id[:8], e, exc_info=True)
-        _finalize_hunt(hunt_id, accumulated, "failed", error=str(e))
+        cost_summary = get_tracker(hunt_id).to_summary()
+        remove_tracker(hunt_id)
+        accumulated["cost_summary"] = cost_summary
+        _hunts[hunt_id].update({
+            "status": "failed",
+            "error": str(e),
+            "completed_at": now_iso(),
+            "cost_summary": cost_summary,
+            "result": accumulated,
+            "leads_count": _unique_leads_count(accumulated.get("leads", [])),
+            "hunt_round": accumulated.get("hunt_round", 0),
+        })
+        save_hunt(hunt_id, _hunts[hunt_id])
+        _broadcast(hunt_id, "failed", {"error": str(e)})
     finally:
         set_progress_callback(None)
 
@@ -908,12 +873,19 @@ async def _run_resume_hunt(hunt_id: str, request: ResumeRequest, prior_result: d
 
     initial_state = _slim_state(prior_result, request)
 
-    _throttle_state = {"last_save": 0.0}
-    set_progress_callback(lambda data: _on_lead_progress(hunt_id, _throttle_state, data))
+    def _on_lead_progress(data: dict) -> None:
+        _broadcast(hunt_id, "lead_progress", data)
+        # Incrementally persist each lead as it's found — survives kill -9
+        if data.get("event") == "lead_found" and data.get("lead"):
+            hunt = _hunts.get(hunt_id)
+            if hunt is not None:
+                result = hunt.setdefault("result", {})
+                leads = result.setdefault("leads", [])
+                leads.append(data["lead"])
+                hunt["leads_count"] = _unique_leads_count(leads)
+                save_hunt(hunt_id, hunt)
 
-    # Initialize accumulated BEFORE the try block so exception handlers
-    # (cancel / failure paths) can always reference it safely.
-    accumulated: dict[str, Any] = dict(initial_state)
+    set_progress_callback(_on_lead_progress)
 
     try:
         _raise_if_hunt_cancelled(hunt_id)
@@ -930,6 +902,7 @@ async def _run_resume_hunt(hunt_id: str, request: ResumeRequest, prior_result: d
 
         prev_stage = "start"
         prev_round = 1
+        accumulated: dict[str, Any] = dict(initial_state)
 
         async for chunk in graph.astream(initial_state):
             _raise_if_hunt_cancelled(hunt_id)
@@ -1289,7 +1262,7 @@ async def send_email_sequence_draft(
             body_text=str(draft.get("body_text", "") or ""),
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=safe_error_detail(exc, context="send-draft")) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     draft["send_status"] = "sent"
     draft["sent_at"] = now_iso()
@@ -1343,7 +1316,7 @@ async def detect_email_sequence_replies(
     try:
         replies = await asyncio.to_thread(search_recent_replies, settings, from_address=recipient)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=safe_error_detail(exc, context="reply-check")) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     sequence["reply_detection"] = {
         "checked_at": now_iso(),
@@ -1384,147 +1357,6 @@ async def list_hunts():
     # Sort by created_at descending (newest first)
     items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     return items
-
-
-# ── Business-optimization request bodies ────────────────────────────────
-class BlacklistCreate(BaseModel):
-    type: Literal["domain", "keyword"] = "keyword"
-    value: str
-    note: str = ""
-
-
-class PortraitCreate(BaseModel):
-    name: str
-    source_customers: list[str] = Field(default_factory=list)
-    insight_summary: str = ""
-
-
-# ── Blacklists (C3) ─────────────────────────────────────────────────────
-@router.get("/blacklists", dependencies=[Depends(require_api_access)])
-async def list_blacklists():
-    """List all blacklist entries."""
-    return {"items": get_blacklists()}
-
-
-@router.post("/blacklists", dependencies=[Depends(require_api_access)])
-async def add_blacklist(payload: BlacklistCreate):
-    """Add a single blacklist entry (domain or keyword)."""
-    item = {
-        "id": uuid.uuid4().hex,
-        "type": payload.type,
-        "value": payload.value,
-        "note": payload.note,
-        "created_at": now_iso(),
-    }
-    if not save_blacklist(item):
-        raise HTTPException(status_code=500, detail="failed to save blacklist")
-    return item
-
-
-@router.post("/blacklists/batch", dependencies=[Depends(require_api_access)])
-async def add_blacklists_batch(payload: list[BlacklistCreate]):
-    """Add multiple blacklist entries at once."""
-    saved: list[dict] = []
-    for p in payload:
-        item = {
-            "id": uuid.uuid4().hex,
-            "type": p.type,
-            "value": p.value,
-            "note": p.note,
-            "created_at": now_iso(),
-        }
-        if save_blacklist(item):
-            saved.append(item)
-    return {"saved": len(saved), "items": saved}
-
-
-@router.delete("/blacklists/{item_id}", dependencies=[Depends(require_api_access)])
-async def remove_blacklist(item_id: str):
-    """Remove a blacklist entry by id."""
-    if not delete_blacklist(item_id):
-        raise HTTPException(status_code=404, detail="blacklist not found")
-    return {"deleted": item_id}
-
-
-# ── Portraits (C4) ──────────────────────────────────────────────────────
-@router.get("/portraits", dependencies=[Depends(require_api_access)])
-async def list_portraits():
-    """List all customer portraits."""
-    return {"items": get_portraits()}
-
-
-@router.post("/portraits", dependencies=[Depends(require_api_access)])
-async def add_portrait(payload: PortraitCreate):
-    """Create a portrait manually (no LLM)."""
-    svc = PortraitService()
-    return svc.create_portrait(
-        name=payload.name,
-        source_customers=payload.source_customers,
-        insight_summary=payload.insight_summary,
-    )
-
-
-@router.get("/portraits/{portrait_id}", dependencies=[Depends(require_api_access)])
-async def get_portrait(portrait_id: str):
-    """Get one portrait by id."""
-    item = get_portrait_by_id(portrait_id)
-    if item is None:
-        raise HTTPException(status_code=404, detail="portrait not found")
-    return item
-
-
-@router.delete("/portraits/{portrait_id}", dependencies=[Depends(require_api_access)])
-async def remove_portrait(portrait_id: str):
-    """Delete a portrait by id."""
-    if not delete_portrait(portrait_id):
-        raise HTTPException(status_code=404, detail="portrait not found")
-    return {"deleted": portrait_id}
-
-
-# ── Portrait expand → hunt (C5) ─────────────────────────────────────────
-@router.post("/portraits/build", dependencies=[Depends(require_api_access)])
-async def build_portrait_api(payload: PortraitCreate):
-    """Build a portrait from source domains via LLM (consumes quota)."""
-    return await build_portrait(
-        name=payload.name,
-        source_domains=payload.source_customers,
-        insight_summary=payload.insight_summary,
-    )
-
-
-@router.post("/portraits/{portrait_id}/expand", dependencies=[Depends(require_api_access)])
-async def expand_portrait(portrait_id: str, target_lead_count: int = 1, max_rounds: int = 1):
-    """Start a real hunt seeded by the portrait's ICP (consumes quota)."""
-    hunt_id = await start_hunt_from_portrait(
-        portrait_id, target_lead_count=target_lead_count, max_rounds=max_rounds
-    )
-    return {"hunt_id": hunt_id, "status": "pending"}
-
-
-# ── Lead enrichment (C6) ────────────────────────────────────────────────
-def _normalize_domain(url: str) -> str:
-    raw = (url or "").strip().lower()
-    raw = re.sub(r"^https?://", "", raw)
-    raw = raw.split("/")[0].split("?")[0].split("#")[0]
-    if raw.startswith("www."):
-        raw = raw[4:]
-    return raw.strip()
-
-
-@router.post("/hunts/{hunt_id}/leads/{lead_key}/enrich", dependencies=[Depends(require_api_access)])
-async def enrich_lead(hunt_id: str, lead_key: str):
-    """Enrich a lead with social/contact data (no-op when no API key)."""
-    lead = find_lead(hunt_id, lead_key)
-    if lead is None:
-        raise HTTPException(status_code=404, detail="lead not found")
-    domain = _normalize_domain(str(lead.get("website") or ""))
-    social = SocialEnricher().enrich(domain=domain)
-    if social:
-        lead.setdefault("social_data", {}).update(social)
-        updated = update_lead(hunt_id, lead_key, {"social_data": lead.get("social_data")})
-        if updated is None:
-            raise HTTPException(status_code=500, detail="failed to persist enrichment")
-    return {"lead_key": lead_key, "social_data": social}
 
 
 @router.get("/hunts/{hunt_id}/cost", dependencies=[Depends(require_api_access)])

@@ -7,26 +7,16 @@ import os as _os
 from datetime import datetime, timezone
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
 from config.settings import get_settings
 from config.settings_store import is_configured, read_settings, update_settings
 from automation.notifier import send_feishu_text
-from api.errors import safe_error_detail
-from api.security import require_api_access
 from emailing.imap_client import test_imap_connection
 from emailing.smtp_client import test_smtp_connection
 
-# This router exposes every secret in .env (read *and* write) plus an
-# outbound-webhook test endpoint. It must never be reachable unauthenticated.
-# Auth in this project is opt-in per route, so the dependency is declared on the
-# router itself — that also covers any endpoint added here in the future.
-router = APIRouter(
-    prefix="/api/settings",
-    tags=["settings"],
-    dependencies=[Depends(require_api_access)],
-)
+router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 
 class SettingsPayload(BaseModel):
@@ -41,9 +31,6 @@ class SettingsPayload(BaseModel):
     zai_api_key: str = ""
     moonshot_api_key: str = ""
     minimax_api_key: str = ""
-    dashscope_api_key: str = ""
-    deepseek_api_key: str = ""
-    volcengine_api_key: str = ""
     email_openai_api_key: str = ""
     email_anthropic_api_key: str = ""
     email_openrouter_api_key: str = ""
@@ -51,12 +38,8 @@ class SettingsPayload(BaseModel):
     email_zai_api_key: str = ""
     email_moonshot_api_key: str = ""
     email_minimax_api_key: str = ""
-    email_dashscope_api_key: str = ""
-    email_deepseek_api_key: str = ""
-    email_volcengine_api_key: str = ""
     serper_api_key: str = ""
     tavily_api_key: str = ""
-    brave_api_key: str = ""
     jina_api_key: str = ""
     email_provider_type: str = ""
     amap_api_key: str = ""
@@ -113,10 +96,6 @@ class SettingsPayload(BaseModel):
     automation_alert_failed_messages_threshold: str = ""
     search_concurrency: str = ""
     scrape_concurrency: str = ""
-    global_crawl_dedup: str = ""
-    social_api_provider: str = ""
-    social_api_key: str = ""
-    social_api_timeout: str = ""
 
 
 class SettingsResponse(BaseModel):
@@ -202,9 +181,6 @@ async def save_settings(payload: SettingsPayload):
         "zai_api_key": "ZAI_API_KEY",
         "moonshot_api_key": "MOONSHOT_API_KEY",
         "minimax_api_key": "MINIMAX_API_KEY",
-        "dashscope_api_key": "DASHSCOPE_API_KEY",
-        "deepseek_api_key": "DEEPSEEK_API_KEY",
-        "volcengine_api_key": "VOLCENGINE_API_KEY",
         "email_openai_api_key": "EMAIL_OPENAI_API_KEY",
         "email_anthropic_api_key": "EMAIL_ANTHROPIC_API_KEY",
         "email_openrouter_api_key": "EMAIL_OPENROUTER_API_KEY",
@@ -212,12 +188,8 @@ async def save_settings(payload: SettingsPayload):
         "email_zai_api_key": "EMAIL_ZAI_API_KEY",
         "email_moonshot_api_key": "EMAIL_MOONSHOT_API_KEY",
         "email_minimax_api_key": "EMAIL_MINIMAX_API_KEY",
-        "email_dashscope_api_key": "EMAIL_DASHSCOPE_API_KEY",
-        "email_deepseek_api_key": "EMAIL_DEEPSEEK_API_KEY",
-        "email_volcengine_api_key": "EMAIL_VOLCENGINE_API_KEY",
         "serper_api_key": "SERPER_API_KEY",
         "tavily_api_key": "TAVILY_API_KEY",
-        "brave_api_key": "BRAVE_API_KEY",
         "jina_api_key": "JINA_API_KEY",
         "email_provider_type": "EMAIL_PROVIDER_TYPE",
         "amap_api_key": "AMAP_API_KEY",
@@ -274,10 +246,6 @@ async def save_settings(payload: SettingsPayload):
         "automation_alert_failed_messages_threshold": "AUTOMATION_ALERT_FAILED_MESSAGES_THRESHOLD",
         "search_concurrency": "SEARCH_CONCURRENCY",
         "scrape_concurrency": "SCRAPE_CONCURRENCY",
-        "global_crawl_dedup": "GLOBAL_CRAWL_DEDUP",
-        "social_api_provider": "SOCIAL_API_PROVIDER",
-        "social_api_key": "SOCIAL_API_KEY",
-        "social_api_timeout": "SOCIAL_API_TIMEOUT",
     }
 
     updates: dict[str, str] = {}
@@ -289,15 +257,7 @@ async def save_settings(payload: SettingsPayload):
         value = provided_fields[field]
         if isinstance(value, str) and _is_masked(value):
             continue
-        text = str(value)
-        # Values are written into .env unquoted, so an embedded newline would
-        # let a caller append arbitrary settings (credential hijack).
-        if any(char in text for char in ("\n", "\r", "\x00")):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid value for '{field}': newline characters are not allowed.",
-            )
-        updates[env_key] = text
+        updates[env_key] = str(value)
         if field in {"email_from_address", "email_smtp_host", "email_smtp_port", "email_smtp_username", "email_smtp_password", "email_use_tls"}:
             smtp_fields_changed = True
         if field in {"email_imap_host", "email_imap_port", "email_imap_username", "email_imap_password"}:
@@ -324,7 +284,7 @@ async def test_email_settings():
     try:
         result = await asyncio.to_thread(test_smtp_connection, settings)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=safe_error_detail(exc, context="smtp-test")) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     tested_at = _now_iso()
     update_settings({"EMAIL_SMTP_LAST_TEST_AT": tested_at})
     _os.environ["EMAIL_SMTP_LAST_TEST_AT"] = tested_at
@@ -345,7 +305,7 @@ async def test_email_imap_settings():
     try:
         result = await asyncio.to_thread(test_imap_connection, settings)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=safe_error_detail(exc, context="imap-test")) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     tested_at = _now_iso()
     update_settings({"EMAIL_IMAP_LAST_TEST_AT": tested_at})
     _os.environ["EMAIL_IMAP_LAST_TEST_AT"] = tested_at
@@ -379,7 +339,7 @@ async def test_automation_feishu_webhook():
             ),
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=safe_error_detail(exc, context="feishu-test")) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return FeishuTestResponse(
         status="ok",
         message="Feishu webhook test sent",
@@ -424,21 +384,12 @@ async def save_license_token(req: SaveTokenRequest):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-MASK_PLACEHOLDER = "****"
-
-
 def _mask(value: str) -> str:
-    """Return a fixed placeholder for any non-empty value.
-
-    Deliberately reveals **no** characters. The previous implementation kept the
-    first and last 4 characters (and returned short values verbatim), which let
-    an unauthenticated reader identify the key type (``sk-``, ``tvly-``, …) and
-    brute-force the remainder far more cheaply.
-    """
-    if not value:
-        return ""
-    return MASK_PLACEHOLDER
+    """Partially mask a secret value for display."""
+    if not value or len(value) < 8:
+        return value
+    return value[:4] + "****" + value[-4:]
 
 
 def _is_masked(value: str) -> bool:
-    return MASK_PLACEHOLDER in value
+    return "****" in value

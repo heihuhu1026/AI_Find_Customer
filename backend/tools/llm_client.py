@@ -30,41 +30,6 @@ _RESPONSE_FORMAT_UNSUPPORTED_PREFIXES = (
 _RATE_LIMIT_BACKOFF_SECONDS = (2, 5, 10)
 
 
-# Virtual provider prefix for Tencent Hunyuan via TokenHub (OpenAI-compatible).
-# Model names look like "tencent/hy3"; the client rewrites them to an
-# "openai/<model>" call against TENCENT_API_BASE with TENCENT_API_KEY so that
-# the official Hunyuan API can be used through the same litellm interface.
-_TENCENT_PREFIX = "tencent/"
-
-
-def _is_tencent_model(model: str) -> bool:
-    return bool(model) and model.startswith(_TENCENT_PREFIX)
-
-
-def _tencent_api_base(settings: Settings) -> str:
-    return (settings.tencent_api_base or "https://tokenhub.tencentmaas.com/v1").rstrip("/")
-
-
-def apply_tencent_transport(settings: Settings, model: str, kwargs: dict) -> str:
-    """Rewrite a ``tencent/<model>`` call to an OpenAI-compatible TokenHub call.
-
-    Mutates ``kwargs`` in place to add ``model`` (``openai/<model>``), ``api_base``,
-    ``api_key`` and (optionally) ``extra_body['reasoning_effort']`` for Hy3's
-    thinking-depth control. Returns the final model string passed to litellm.
-    No-op (returns ``model`` unchanged) for non-tencent models.
-    """
-    if not _is_tencent_model(model):
-        return model
-    real_model = model[len(_TENCENT_PREFIX):] or "hy3"
-    kwargs["model"] = "openai/" + real_model
-    kwargs["api_base"] = _tencent_api_base(settings)
-    kwargs["api_key"] = settings.tencent_api_key
-    effort = settings.tencent_reasoning_effort
-    if effort:
-        kwargs.setdefault("extra_body", {})["reasoning_effort"] = effort
-    return kwargs["model"]
-
-
 def normalize_minimax_api_base(api_base: str) -> str:
     """Normalize MiniMax API base URLs to the OpenAI-compatible `/v1` form."""
     base = (api_base or "").strip().rstrip("/")
@@ -169,7 +134,6 @@ class LLMTool:
       - ``zai/glm-4.7``
       - ``moonshot/moonshot-v1-128k``
       - ``minimax/MiniMax-Text-01``
-      - ``tencent/hy3``   (腾讯混元 via TokenHub, OpenAI-compatible; needs TENCENT_API_KEY)
 
     Args:
         model_type: ``"default"`` uses ``llm_model`` (fast, cheap — data extraction).
@@ -269,10 +233,6 @@ class LLMTool:
                     self.model,
                 )
 
-        # Tencent Hunyuan (TokenHub) virtual provider → OpenAI-compatible transport.
-        # Rewrites "tencent/<model>" to an "openai/<model>" call against TokenHub.
-        apply_tencent_transport(self._settings, self.model, kwargs)
-
         limiter = get_llm_rate_limiter(self._model_type, self._requests_per_minute)
         last_exc: Exception | None = None
         response = None
@@ -313,8 +273,8 @@ class LLMTool:
                         cost_usd=float(cost),
                         hunt_round=self._hunt_round,
                     )
-            except Exception as exc:
-                logger.debug("[llm_client] cost tracking skipped: %s", exc)
+            except Exception:
+                pass  # Never let tracking break the main flow
 
         return response.choices[0].message.content
 

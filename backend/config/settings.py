@@ -100,20 +100,6 @@ class Settings(BaseSettings):
     reasoning_max_tokens: int = 4096
     reasoning_requests_per_minute: int = 0
 
-    # --- Model fallback chains (百炼多模型额度轮换) ---
-    # 主模型额度耗尽/限流/不可用时，自动切到列表中的下一个模型继续。
-    # 逗号分隔；模型名可带 dashscope/ 前缀或裸名（裸名自动补 dashscope/）。
-    # 本地兜底请写全名，例如 ollama/qwen2.5:7b-instruct-q4_K_M（放最后）。
-    llm_model_fallback: str = ""
-    reasoning_model_fallback: str = ""
-    email_llm_model_fallback: str = ""
-    email_reasoning_model_fallback: str = ""
-
-    # --- Local model endpoint (Ollama) ---
-    # 本地模型作为云端额度全耗尽时的最后兜底，无需 API Key。
-    ollama_api_base: str = "http://127.0.0.1:11434"
-    ollama_request_timeout: int = 300
-
     # --- LLM Provider API Keys ---
     openai_api_key: str = ""
     anthropic_api_key: str = ""
@@ -123,9 +109,6 @@ class Settings(BaseSettings):
     moonshot_api_key: str = ""    # Kimi / Moonshot AI
     minimax_api_key: str = ""
     minimax_api_base: str = "https://api.minimax.io/v1"
-    dashscope_api_key: str = ""   # 阿里云百炼 (DashScope / Qwen)
-    deepseek_api_key: str = ""    # DeepSeek 官方
-    volcengine_api_key: str = ""  # 火山方舟 (豆包)
     email_openai_api_key: str = ""
     email_anthropic_api_key: str = ""
     email_openrouter_api_key: str = ""
@@ -133,43 +116,11 @@ class Settings(BaseSettings):
     email_zai_api_key: str = ""
     email_moonshot_api_key: str = ""
     email_minimax_api_key: str = ""
-    email_dashscope_api_key: str = ""
-    email_deepseek_api_key: str = ""
-    email_volcengine_api_key: str = ""
-
-    # --- Tencent Hunyuan (TokenHub) — OpenAI-compatible endpoint ---
-    # 腾讯混元大模型官方 API（TokenHub），OpenAI 兼容格式。
-    # 用法：把 LLM_MODEL / REASONING_MODEL 设为虚拟前缀 "tencent/<model>"，
-    # 例如 tencent/hy3。LLM 客户端会自动改写为 OpenAI 兼容调用并附带 base/key。
-    # 申请/领取免费额度：腾讯云 TokenHub 控制台
-    #   https://console.cloud.tencent.com/tokenhub/
-    # 新用户可领 100 万 Tokens 免费体验包（90 天有效）。
-    # 注意：该通道仅在使用 tencent/ 前缀时生效；其它 provider 不受影响。
-    tencent_api_key: str = ""
-    tencent_api_base: str = "https://tokenhub.tencentmaas.com/v1"
-    tencent_reasoning_effort: str = "low"  # Hy3 思考深度：no_think / low / high
 
     # --- Search ---
     serper_api_key: str = ""
     tavily_api_key: str = ""      # supports multiple keys: "key1,key2"
-    brave_api_key: str = ""       # Brave Search API (free tier: 2,000 queries/month)
     jina_api_key: str = ""
-    # Ordered search-backend preference (subset of brave/tavily/serper).
-    # First reachable backend wins. In networks that block some providers
-    # (e.g. corporate proxies), put the reachable one first to skip retries.
-    search_backend_order: str = "brave,tavily,serper"
-    # When a backend is unreachable, fail fast instead of long backoff.
-    search_backend_retry_attempts: int = 2
-    search_backend_timeout: float = 12.0
-    # Jina Reader page fetch: 0 disables network fetch (uses search snippet only).
-    jina_reader_enabled: bool = True
-
-    # --- Cross-task crawl deduplication ---
-    # When True (default), domains already crawled in previous hunts are skipped
-    # during lead extraction, preventing duplicate page fetches / ReAct runs across
-    # multiple search tasks. Set False to crawl every candidate fresh each hunt.
-    # Persistent record: backend/data/global_crawl_dedup.json (delete file to fully reset).
-    global_crawl_dedup: bool = True
 
     # --- Email ---
     email_provider_type: str = "smtp"
@@ -238,7 +189,7 @@ class Settings(BaseSettings):
     search_concurrency: int = 10  # max concurrent Serper API calls
     scrape_concurrency: int = 5   # max concurrent Jina Reader calls
     email_gen_concurrency: int = 3  # max concurrent LLM calls for email generation
-    react_max_iterations: int = 3   # max ReAct loop iterations per URL (token optimization: 5->3)
+    react_max_iterations: int = 5   # max ReAct loop iterations per URL
 
     # --- API ---
     api_host: str = "0.0.0.0"
@@ -246,13 +197,6 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://localhost:3000", "http://localhost:3001"]
     api_access_token: str = ""
     settings_api_enabled: bool = True
-    # When False, X-Forwarded-For is ignored entirely. Behind nginx / Caddy /
-    # Docker port-mapping, request.client.host is always the proxy (127.0.0.1),
-    # so the localhost bypass would silently allow every remote caller.
-    # Only enable this once you have confirmed the deployment terminates
-    # connections at a proxy you control and that it overwrites (not appends to)
-    # X-Forwarded-For.
-    trust_proxy_headers: bool = False
 
     # --- Database (checkpointer) ---
     # In packaged mode, redirected to ~/Library/Application Support/AIHunter/
@@ -286,25 +230,8 @@ class Settings(BaseSettings):
     upload_dir: str = _resolve_dir("uploads")
     max_upload_size_mb: int = 50
 
-    # --- Social enrichment (Apollo etc.) ---
-    social_api_provider: str = "apollo"
-    social_api_key: str = ""
-    social_api_timeout: int = 15
-
 
 @lru_cache
 def get_settings() -> Settings:
     """Return cached settings singleton."""
     return Settings()
-
-
-def reload_settings() -> Settings:
-    """Drop the cached singleton and re-read .env.
-
-    Needed so that saving settings (or editing .env) takes effect in the
-    already-running server process without a full restart. pydantic-settings
-    only reads the env file once per process; get_settings() is @lru_cache'd
-    on top of that, so callers must explicitly clear it after a change.
-    """
-    get_settings.cache_clear()
-    return get_settings()

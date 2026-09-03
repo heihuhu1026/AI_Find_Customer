@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -39,33 +37,11 @@ class HuntJobQueue:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
 
-    @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        """Yield a SQLite connection and guarantee it is committed and closed.
-
-        See `emailing.store.EmailStore._connect` for the rationale: the `with
-        sqlite3.Connection` form commits but does not close, leaking a file
-        handle per call.
-        """
+    def _connect(self) -> sqlite3.Connection:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path)
-        try:
-            conn.row_factory = sqlite3.Row
-            # This DB is shared by the API process and standalone workers
-            # (scripts/headless_worker.py). WAL lets readers keep working while a
-            # writer holds the lock; busy_timeout makes concurrent writers wait for
-            # the lock instead of failing with "database is locked".
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=5000")
-            try:
-                yield conn
-            except BaseException:
-                conn.rollback()
-                raise
-            else:
-                conn.commit()
-        finally:
-            conn.close()
+        conn.row_factory = sqlite3.Row
+        return conn
 
     def init_db(self) -> None:
         with self._connect() as conn:
@@ -271,8 +247,6 @@ class HuntJobQueue:
 
     def mark_completed(self, job_id: str, *, hunt_id: str, finished_at: str) -> None:
         with self._connect() as conn:
-            conn.isolation_level = None
-            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
                 UPDATE hunt_jobs
@@ -287,12 +261,9 @@ class HuntJobQueue:
                 """,
                 (finished_at, finished_at, hunt_id, job_id),
             )
-            conn.execute("COMMIT")
 
     def mark_failed(self, job_id: str, *, error_message: str, finished_at: str) -> None:
         with self._connect() as conn:
-            conn.isolation_level = None
-            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
                 UPDATE hunt_jobs
@@ -304,12 +275,9 @@ class HuntJobQueue:
                 """,
                 (finished_at, finished_at, error_message[:2000], job_id),
             )
-            conn.execute("COMMIT")
 
     def requeue(self, job_id: str, *, available_at: str, error_message: str, updated_at: str, hunt_id: str = "") -> None:
         with self._connect() as conn:
-            conn.isolation_level = None
-            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """
                 UPDATE hunt_jobs
@@ -322,7 +290,6 @@ class HuntJobQueue:
                 """,
                 (available_at, updated_at, error_message[:2000], hunt_id, hunt_id, job_id),
             )
-            conn.execute("COMMIT")
 
     def cancel(self, job_id: str, *, updated_at: str) -> None:
         with self._connect() as conn:
@@ -385,13 +352,10 @@ class HuntJobQueue:
             values.append(template_seed_source)
         values.append(job_id)
         with self._connect() as conn:
-            conn.isolation_level = None
-            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 f"UPDATE hunt_jobs SET {', '.join(fields)} WHERE id = ?",
                 values,
             )
-            conn.execute("COMMIT")
 
     def mark_template_seed_preparing(self, job_id: str, *, updated_at: str) -> bool:
         with self._connect() as conn:
