@@ -9,6 +9,7 @@ simple and robust.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -58,8 +59,8 @@ class SocialEnricher:
         payload: dict[str, Any] = {"per_page": 1}
         if domain:
             payload["q_keywords"] = domain
-        if linkedin_url:
-            payload["q_organization_domains_list"] = [domain] if domain else None
+        elif linkedin_url:
+            payload["q_keywords"] = linkedin_url
         try:
             resp = requests.post(
                 _APOLLO_PEOPLE_SEARCH_URL,
@@ -90,5 +91,5 @@ class SocialEnricher:
             "department": person.get("department") or "",
             "summary": person.get("headline") or person.get("summary") or "",
             "source": "apollo",
-            "enriched_at": "",
+            "enriched_at": datetime.now(timezone.utc).isoformat(),
         }

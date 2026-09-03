@@ -200,4 +200,8 @@ async def start_hunt_from_portrait(
         email_template_notes="",
     )
     resp = await routes.create_hunt_internal(request)
+    try:
+        svc.bump_stats(portrait_id, hunt_count_delta=1)
+    except Exception as e:  # defensive — don't fail the hunt on a stats bump
+        logger.warning("[PortraitBuilder] failed to bump portrait stats: %s", e)
     return resp.hunt_id

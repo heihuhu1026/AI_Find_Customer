@@ -907,7 +907,32 @@ def _blacklist_matches_lead(lead: dict) -> tuple[bool, str]:
     return False, ""
 
 
-def _lead_should_be_filtered(lead: dict, filters: dict | None) -> tuple[bool, str]:
+def _load_contacted_domains() -> set[str]:
+    """Collect the set of domains that already have generated email sequences.
+
+    Loads all hunts once so the exclude-contacted check can run in O(1) per
+    candidate instead of reloading every hunt JSON per candidate.
+    """
+    from utils.storage import load_all_hunts  # local import to avoid cycles
+
+    domains: set[str] = set()
+    for hunt in load_all_hunts().values():
+        result = hunt.get("result") or {}
+        for sequence in (result.get("email_sequences") or []):
+            if not isinstance(sequence, dict):
+                continue
+            lead = sequence.get("lead") or {}
+            d = _filter_bare_domain(str(lead.get("website") or ""))
+            if d:
+                domains.add(d)
+    return domains
+
+
+def _lead_should_be_filtered(
+    lead: dict,
+    filters: dict | None,
+    contacted_domains: set[str] | None = None,
+) -> tuple[bool, str]:
     """Apply a hunt's filter rules to a finalized lead candidate."""
     if not isinstance(filters, dict):
         return False, ""
@@ -918,7 +943,12 @@ def _lead_should_be_filtered(lead: dict, filters: dict | None) -> tuple[bool, st
                 return True, reason
         if bool(filters.get("exclude_contacted", True)):
             domain = _filter_bare_domain(str(lead.get("website") or ""))
-            if domain and storage_has_contacted_before(domain):
+            if not domain:
+                return False, ""
+            if contacted_domains is not None:
+                if domain in contacted_domains:
+                    return True, "exclude_contacted"
+            elif storage_has_contacted_before(domain):
                 return True, "exclude_contacted"
     except Exception as e:  # defensive — never block extraction
         logger.warning("[LeadExtractAgent] filter check error (kept lead): %s", e)
@@ -1694,6 +1724,9 @@ async def lead_extract_node(state: HuntState) -> dict:
     seen_domains = set(existing_domains)
     hunt_filters = state.get("filters")
     hunt_filters = hunt_filters if isinstance(hunt_filters, dict) else None
+    contacted_domains: set[str] | None = None
+    if hunt_filters and hunt_filters.get("exclude_contacted", True):
+        contacted_domains = _load_contacted_domains()
     filtered_out = 0
     filter_reasons: dict[str, int] = {}
 
@@ -1706,7 +1739,7 @@ async def lead_extract_node(state: HuntState) -> dict:
         if official_domain:
             seen_domains.add(official_domain)
         if hunt_filters:
-            dropped, reason = _lead_should_be_filtered(lead, hunt_filters)
+            dropped, reason = _lead_should_be_filtered(lead, hunt_filters, contacted_domains)
             if dropped:
                 filtered_out += 1
                 filter_reasons[reason] = filter_reasons.get(reason, 0) + 1

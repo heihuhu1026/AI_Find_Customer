@@ -16,6 +16,7 @@ from utils.storage import (
     get_portraits,
     save_portrait,
     delete_portrait as storage_delete_portrait,
+    now_iso,
 )
 
 
@@ -37,7 +38,7 @@ class PortraitService:
             "source_customers": list(source_customers or []),
             "icp": icp_model.model_dump(),
             "insight_summary": insight_summary or "",
-            "created_at": "",
+            "created_at": now_iso(),
             "hunt_count": 0,
             "total_leads": 0,
         }
