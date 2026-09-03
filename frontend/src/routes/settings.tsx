@@ -13,11 +13,15 @@ import {
   RefreshCw,
   ChevronDown,
   Check,
+  ShieldAlert,
+  Trash2,
+  Plus,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { api } from "@/api/client";
+import { Badge } from "@/components/ui/badge";
+import { api, Blacklist } from "@/api/client";
 import {
   Card,
   CardContent,
@@ -1178,6 +1182,167 @@ function AutomationNotifyPanel({
   );
 }
 
+// ── Blacklist management panel ─────────────────────────────────────────────
+function BlacklistPanel() {
+  const queryClient = useQueryClient();
+  const [type, setType] = useState<"domain" | "keyword">("domain");
+  const [value, setValue] = useState("");
+  const [note, setNote] = useState("");
+  const [batchText, setBatchText] = useState("");
+  const [error, setError] = useState("");
+
+  const { data } = useQuery({
+    queryKey: ["blacklists"],
+    queryFn: api.listBlacklists,
+    retry: false,
+  });
+  const items = data?.items ?? [];
+
+  const addMutation = useMutation({
+    mutationFn: (payload: { type: "domain" | "keyword"; value: string; note: string }) =>
+      api.createBlacklist(payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["blacklists"] });
+      setValue("");
+      setNote("");
+    },
+  });
+
+  const batchMutation = useMutation({
+    mutationFn: (items: { type: "domain" | "keyword"; value: string }[]) =>
+      api.createBlacklistsBatch(items),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["blacklists"] });
+      setBatchText("");
+    },
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: (itemId: string) => api.deleteBlacklist(itemId),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["blacklists"] }),
+  });
+
+  const handleAdd = () => {
+    setError("");
+    if (!value.trim()) {
+      setError("请填写黑名单值");
+      return;
+    }
+    addMutation.mutate({ type, value: value.trim(), note: note.trim() });
+  };
+
+  const handleBatch = () => {
+    setError("");
+    // 每行一条；支持 "type,value" 或纯 value（默认按当前 type）
+    const lines = batchText.split(/\n/).map((l) => l.trim()).filter(Boolean);
+    if (!lines.length) {
+      setError("请粘贴至少一条");
+      return;
+    }
+    const parsed = lines.map((line) => {
+      const parts = line.split(/[,，\t]/).map((s) => s.trim()).filter(Boolean);
+      if (parts.length >= 2 && (parts[0] === "domain" || parts[0] === "keyword")) {
+        return { type: parts[0] as "domain" | "keyword", value: parts[1] };
+      }
+      return { type, value: line };
+    });
+    batchMutation.mutate(parsed);
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <ShieldAlert className="h-5 w-5 text-primary" />
+          黑名单过滤
+        </CardTitle>
+        <CardDescription>命中黑名单的域名/关键词会在挖掘时被排除</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-5">
+        {/* 单条添加 */}
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-end gap-3">
+            <div className="space-y-1.5">
+              <Label>类型</Label>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setType("domain")}
+                  className={`rounded-md border px-3 py-1.5 text-sm ${type === "domain" ? "border-primary bg-primary/10 text-primary" : "text-muted-foreground"}`}
+                >
+                  域名
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setType("keyword")}
+                  className={`rounded-md border px-3 py-1.5 text-sm ${type === "keyword" ? "border-primary bg-primary/10 text-primary" : "text-muted-foreground"}`}
+                >
+                  关键词
+                </button>
+              </div>
+            </div>
+            <div className="flex-1 min-w-[180px] space-y-1.5">
+              <Label>值</Label>
+              <Input placeholder={type === "domain" ? "example.com" : "free"} value={value} onChange={(e) => setValue(e.target.value)} />
+            </div>
+            <div className="flex-1 min-w-[140px] space-y-1.5">
+              <Label>备注（可选）</Label>
+              <Input placeholder="原因" value={note} onChange={(e) => setNote(e.target.value)} />
+            </div>
+            <Button onClick={handleAdd} disabled={addMutation.isPending}>
+              {addMutation.isPending ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Plus className="h-4 w-4 mr-2" />}
+              添加
+            </Button>
+          </div>
+        </div>
+
+        {/* 批量导入 */}
+        <div className="space-y-2">
+          <Label>批量导入（每行一条；可选 "域名,值" 格式）</Label>
+          <textarea
+            className="min-h-[90px] w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            placeholder={"evilcorp.com\ncompetitor.net\nkeyword, free shipping"}
+            value={batchText}
+            onChange={(e) => setBatchText(e.target.value)}
+          />
+          <Button variant="outline" onClick={handleBatch} disabled={batchMutation.isPending}>
+            {batchMutation.isPending ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Plus className="h-4 w-4 mr-2" />}
+            批量导入
+          </Button>
+        </div>
+
+        {error && <p className="text-sm text-destructive">{error}</p>}
+
+        {/* 列表 */}
+        {items.length > 0 ? (
+          <div className="space-y-2">
+            {items.map((item: Blacklist) => (
+              <div key={item.id} className="flex items-center gap-3 rounded-md border px-3 py-2 text-sm">
+                <Badge variant={item.type === "domain" ? "secondary" : "outline"}>
+                  {item.type === "domain" ? "域名" : "关键词"}
+                </Badge>
+                <span className="flex-1 truncate font-mono text-xs">{item.value}</span>
+                {item.note && <span className="text-xs text-muted-foreground truncate max-w-[180px]">{item.note}</span>}
+                <button
+                  type="button"
+                  className="text-muted-foreground hover:text-destructive"
+                  title="删除"
+                  disabled={deleteMutation.isPending}
+                  onClick={() => deleteMutation.mutate(item.id)}
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground">暂无黑名单条目</p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 // ── Main Settings Page ────────────────────────────────────────────────────────
 
 export function SettingsPage() {
@@ -1363,6 +1528,9 @@ export function SettingsPage() {
         values={values}
         onChange={handleChange}
       />
+
+      {/* Blacklist */}
+      <BlacklistPanel />
 
       <div className="flex justify-end pb-8">
         <Button onClick={handleSave} disabled={saveMutation.isPending} size="lg">

@@ -26,6 +26,71 @@ export interface HuntRequest {
   enable_email_craft: boolean;
   email_template_examples: string[];
   email_template_notes: string;
+  // ── business-optimization extended fields (all optional; backend has defaults) ──
+  mode?: "forward" | "reverse" | "hybrid";
+  competitors?: string[];
+  reverse_templates?: string[];
+  filters?: {
+    use_blacklist?: boolean;
+    exclude_contacted?: boolean;
+    sources?: string[];
+    regions?: string[];
+  } | null;
+}
+
+// ── Business-optimization types (C3–C6) ──
+export interface Blacklist {
+  id: string;
+  type: "domain" | "keyword";
+  value: string;
+  note: string;
+  created_at: string;
+}
+
+export interface BlacklistCreate {
+  type: "domain" | "keyword";
+  value: string;
+  note?: string;
+}
+
+export interface ICPProfile {
+  industries: string[];
+  employee_range: string[];
+  regions: string[];
+  keywords: string[];
+  tech_stack: string[];
+}
+
+export interface Portrait {
+  id: string;
+  name: string;
+  source_customers: string[];
+  icp: ICPProfile;
+  insight_summary: string;
+  created_at: string;
+  hunt_count: number;
+  total_leads: number;
+}
+
+export interface PortraitCreate {
+  name: string;
+  source_customers?: string[];
+  insight_summary?: string;
+}
+
+export interface PortraitBuildRequest {
+  name: string;
+  source_customers: string[];
+  insight_summary?: string;
+}
+
+export interface SocialData {
+  linkedin_url?: string;
+  job_title?: string;
+  department?: string;
+  summary?: string;
+  source?: string;
+  enriched_at?: string;
 }
 
 export interface UploadedFile {
@@ -128,6 +193,8 @@ export interface HuntResult {
   round_feedback: Record<string, unknown> | null;
   keyword_search_stats: Record<string, unknown>;
   search_result_count: number;
+  // business-optimization: cumulative filter stats ({total_filtered, by_reason})
+  filter_stats?: { total_filtered?: number; by_reason?: Record<string, number> };
 }
 
 export interface LLMAgentCost {
@@ -713,4 +780,62 @@ export const api = {
     const url = `${API_BASE}/hunts/${huntId}/stream${suffix}`;
     return new EventSource(url);
   },
+
+  // ── Blacklist (C3) ──
+  listBlacklists: () =>
+    request<{ items: Blacklist[] }>("/blacklists"),
+
+  createBlacklist: (data: BlacklistCreate) =>
+    request<Blacklist>("/blacklists", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  createBlacklistsBatch: (items: BlacklistCreate[]) =>
+    request<{ saved: number; items: Blacklist[] }>("/blacklists/batch", {
+      method: "POST",
+      body: JSON.stringify(items),
+    }),
+
+  deleteBlacklist: (itemId: string) =>
+    request<{ deleted: string }>(`/blacklists/${itemId}`, {
+      method: "DELETE",
+    }),
+
+  // ── Portraits (C4 / C5) ──
+  listPortraits: () =>
+    request<{ items: Portrait[] }>("/portraits"),
+
+  createPortrait: (data: PortraitCreate) =>
+    request<Portrait>("/portraits", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  getPortrait: (portraitId: string) =>
+    request<Portrait>(`/portraits/${portraitId}`),
+
+  deletePortrait: (portraitId: string) =>
+    request<{ deleted: string }>(`/portraits/${portraitId}`, {
+      method: "DELETE",
+    }),
+
+  buildPortrait: (data: PortraitBuildRequest) =>
+    request<Portrait>("/portraits/build", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  expandPortrait: (portraitId: string, targetLeadCount = 1, maxRounds = 1) =>
+    request<{ hunt_id: string; status: string }>(
+      `/portraits/${portraitId}/expand?target_lead_count=${targetLeadCount}&max_rounds=${maxRounds}`,
+      { method: "POST" }
+    ),
+
+  // ── Lead enrichment (C6) ──
+  enrichLead: (huntId: string, leadKey: string) =>
+    request<{ lead_key: string; social_data: SocialData | Record<string, never> }>(
+      `/hunts/${huntId}/leads/${leadKey}/enrich`,
+      { method: "POST" }
+    ),
 };

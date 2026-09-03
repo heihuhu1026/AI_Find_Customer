@@ -1,5 +1,5 @@
 import { Link, Outlet } from "@tanstack/react-router";
-import { Crosshair, LayoutDashboard, Plus, Settings } from "lucide-react";
+import { Crosshair, LayoutDashboard, Plus, Settings, Layers } from "lucide-react";
 
 export function RootLayout() {
   return (
@@ -24,6 +24,13 @@ export function RootLayout() {
             >
               <Plus className="h-4 w-4" />
               新建任务
+            </Link>
+            <Link
+              to="/portraits"
+              className="flex items-center gap-1.5 text-muted-foreground transition-colors hover:text-foreground [&.active]:text-foreground"
+            >
+              <Layers className="h-4 w-4" />
+              客户画像
             </Link>
           </nav>
           <div className="ml-auto">

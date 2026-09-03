@@ -5,6 +5,8 @@ import { NewHuntPage } from "./new-hunt";
 import { HuntDetailPage } from "./hunt-detail";
 import { AutomationJobPage } from "./automation-job";
 import { SettingsPage } from "./settings";
+import { PortraitsPage } from "./portraits";
+import { PortraitDetailPage } from "./portrait-detail";
 
 const rootRoute = createRootRoute({ component: RootLayout });
 
@@ -38,10 +40,24 @@ const settingsRoute = createRoute({
   component: SettingsPage,
 });
 
+const portraitsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/portraits",
+  component: PortraitsPage,
+});
+
+const portraitDetailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/portraits/$portraitId",
+  component: PortraitDetailPage,
+});
+
 export const routeTree = rootRoute.addChildren([
   indexRoute,
   newHuntRoute,
   huntDetailRoute,
   automationJobRoute,
   settingsRoute,
+  portraitsRoute,
+  portraitDetailRoute,
 ]);

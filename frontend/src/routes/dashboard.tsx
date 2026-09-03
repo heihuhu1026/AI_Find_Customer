@@ -4,7 +4,7 @@ import { api, AutomationJob } from "@/api/client";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Plus, Crosshair, Users, Loader2, Globe, Clock, MapPin, Tag, Mail, Send, AlertTriangle, Workflow, Reply, Bell } from "lucide-react";
+import { Plus, Crosshair, Users, Loader2, Globe, Clock, MapPin, Tag, Mail, Send, AlertTriangle, Workflow, Reply, Bell, Layers } from "lucide-react";
 import { useMemo, useState } from "react";
 
 function formatTime(iso: string) {
@@ -93,12 +93,20 @@ export function DashboardPage() {
           <h1 className="text-3xl font-bold tracking-tight">自动化控制台</h1>
           <p className="text-muted-foreground mt-1">前端负责提交 queue job，后端 consumer 负责准备模板 seed、执行 hunt、创建 campaign 和发送队列</p>
         </div>
-        <Link to="/hunts/new">
-          <Button>
-            <Plus className="h-4 w-4 mr-2" />
-            新建任务
-          </Button>
-        </Link>
+        <div className="flex items-center gap-2">
+          <Link to="/hunts/new">
+            <Button>
+              <Plus className="h-4 w-4 mr-2" />
+              新建任务
+            </Button>
+          </Link>
+          <Link to="/portraits">
+            <Button variant="outline">
+              <Layers className="h-4 w-4 mr-2" />
+              客户画像库
+            </Button>
+          </Link>
+        </div>
       </div>
 
       {dashboardErrors.length > 0 && (
