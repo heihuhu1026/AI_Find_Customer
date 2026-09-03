@@ -246,6 +246,13 @@ class Settings(BaseSettings):
     cors_origins: list[str] = ["http://localhost:3000", "http://localhost:3001"]
     api_access_token: str = ""
     settings_api_enabled: bool = True
+    # When False, X-Forwarded-For is ignored entirely. Behind nginx / Caddy /
+    # Docker port-mapping, request.client.host is always the proxy (127.0.0.1),
+    # so the localhost bypass would silently allow every remote caller.
+    # Only enable this once you have confirmed the deployment terminates
+    # connections at a proxy you control and that it overwrites (not appends to)
+    # X-Forwarded-For.
+    trust_proxy_headers: bool = False
 
     # --- Database (checkpointer) ---
     # In packaged mode, redirected to ~/Library/Application Support/AIHunter/

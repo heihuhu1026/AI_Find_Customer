@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -37,17 +39,33 @@ class HuntJobQueue:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Yield a SQLite connection and guarantee it is committed and closed.
+
+        See `emailing.store.EmailStore._connect` for the rationale: the `with
+        sqlite3.Connection` form commits but does not close, leaking a file
+        handle per call.
+        """
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        # This DB is shared by the API process and standalone workers
-        # (scripts/headless_worker.py). WAL lets readers keep working while a
-        # writer holds the lock; busy_timeout makes concurrent writers wait for
-        # the lock instead of failing with "database is locked".
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            # This DB is shared by the API process and standalone workers
+            # (scripts/headless_worker.py). WAL lets readers keep working while a
+            # writer holds the lock; busy_timeout makes concurrent writers wait for
+            # the lock instead of failing with "database is locked".
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            try:
+                yield conn
+            except BaseException:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+        finally:
+            conn.close()
 
     def init_db(self) -> None:
         with self._connect() as conn:

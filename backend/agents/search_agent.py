@@ -427,8 +427,8 @@ async def search_node(state: HuntState) -> dict:
             tracker = get_tracker(hunt_id)
             for r in raw_results:
                 tracker.record_search_call(provider=r.get("source", "google_maps"), result_count=r.get("result_count", 0))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[search_agent] search cost tracking skipped: %s", exc)
 
     for _t in (maps_tool, web_tool):
         if _t is not None:

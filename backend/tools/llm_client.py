@@ -313,8 +313,8 @@ class LLMTool:
                         cost_usd=float(cost),
                         hunt_round=self._hunt_round,
                     )
-            except Exception:
-                pass  # Never let tracking break the main flow
+            except Exception as exc:
+                logger.debug("[llm_client] cost tracking skipped: %s", exc)
 
         return response.choices[0].message.content
 

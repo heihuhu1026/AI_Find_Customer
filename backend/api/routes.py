@@ -106,6 +106,33 @@ def _unique_leads_count(leads: list[dict[str, Any]]) -> int:
     return len(_dedupe_leads(leads))
 
 
+def _on_lead_progress(hunt_id: str, throttle_state: dict, data: dict) -> None:
+    """SSE-broadcast and incrementally persist a lead-found progress event.
+
+    Shared by both ``_run_hunt`` and ``_run_resume_hunt`` — previously this
+    18-line block was duplicated verbatim in both, which risks the two copies
+    drifting apart.
+
+    Incrementally persisting leads survives ``kill -9``. The write is throttled
+    because ``save_hunt`` rewrites the whole hunt JSON: flush at most once per
+    ``_LEAD_SAVE_INTERVAL_SECONDS`` (authoritative state is still checkpointed
+    at stage changes and fully flushed at hunt end).
+    """
+    _broadcast(hunt_id, "lead_progress", data)
+    if data.get("event") == "lead_found" and data.get("lead"):
+        hunt = _hunts.get(hunt_id)
+        if hunt is not None:
+            result = hunt.setdefault("result", {})
+            leads = result.setdefault("leads", [])
+            leads.append(data["lead"])
+            hunt["leads_count"] = _unique_leads_count(leads)
+            now = time.monotonic()
+            if now - throttle_state["last_save"] >= _LEAD_SAVE_INTERVAL_SECONDS:
+                if not save_hunt(hunt_id, hunt):
+                    logger.error("[Hunt %s] Failed to persist incremental leads", hunt_id[:8])
+                throttle_state["last_save"] = now
+
+
 def _validate_uploaded_file_ids(file_ids: list[str]) -> list[str]:
     """Accept only files that exist under the managed upload directory."""
     if not file_ids:
@@ -588,19 +615,9 @@ def _broadcast_stage_data(hunt_id: str, completed_stage: str, state: dict) -> No
 
 # ── Background task runner ──────────────────────────────────────────────
 
-async def _run_hunt(hunt_id: str, request: HuntRequest) -> None:
-    """Run the full hunt pipeline in the background."""
-    _hunts[hunt_id]["status"] = "running"
-    logger.info(
-        "[Hunt %s] Starting — url=%s, files=%d, desc=%r, keywords=%s, profile=%s, regions=%s, email=%s",
-        hunt_id[:8], request.website_url or "(none)",
-        len(request.uploaded_file_ids),
-        request.description[:60] if request.description else "",
-        request.product_keywords, request.target_customer_profile,
-        request.target_regions, request.enable_email_craft,
-    )
-
-    initial_state = {
+def _build_initial_state(request: HuntRequest, hunt_id: str) -> dict[str, Any]:
+    """Construct the initial LangGraph state dict for a hunt."""
+    return {
         "website_url": request.website_url,
         "description": request.description,
         "product_keywords": request.product_keywords,
@@ -636,29 +653,114 @@ async def _run_hunt(hunt_id: str, request: HuntRequest) -> None:
         "messages": [],
     }
 
+
+def _apply_hunt_chunk(hunt_id: str, chunk: dict, accumulated: dict, prev: dict) -> None:
+    """Merge one LangGraph stream chunk into ``accumulated`` and broadcast updates.
+
+    ``prev`` is a mutable ``{"stage": str, "round": int}`` carrying cross-chunk
+    stage/round state across the stream.
+    """
+    for node_name, node_output in chunk.items():
+        if node_name == "__end__":
+            continue
+
+        accumulated.update(node_output)
+
+        stage = node_output.get("current_stage", prev["stage"])
+        hunt_round = accumulated.get("hunt_round", prev["round"])
+        leads_count = _unique_leads_count(accumulated.get("leads", []))
+        email_count = len(accumulated.get("email_sequences", []))
+
+        _hunts[hunt_id].update({
+            "current_stage": stage,
+            "hunt_round": hunt_round,
+            "leads_count": leads_count,
+            "email_sequences_count": email_count,
+        })
+
+        if stage != prev["stage"]:
+            logger.info("[Hunt %s] Stage: %s → %s (round %d, leads %d)",
+                        hunt_id[:8], prev["stage"], stage, hunt_round, leads_count)
+            _broadcast(hunt_id, "stage_change", {
+                "stage": stage,
+                "hunt_round": hunt_round,
+                "leads_count": leads_count,
+            })
+
+            # Broadcast detail data for the stage that just completed
+            _broadcast_stage_data(hunt_id, prev["stage"], accumulated)
+
+            # Checkpoint: persist accumulated state so kill -9 doesn't lose data
+            _hunts[hunt_id]["result"] = dict(accumulated)
+            save_hunt(hunt_id, _hunts[hunt_id])
+
+            prev["stage"] = stage
+
+        if hunt_round != prev["round"]:
+            logger.info("[Hunt %s] Round %d → %d", hunt_id[:8], prev["round"], hunt_round)
+            _broadcast(hunt_id, "round_change", {"hunt_round": hunt_round})
+            prev["round"] = hunt_round
+
+        _broadcast(hunt_id, "progress", {
+            "leads_count": leads_count,
+            "email_sequences_count": email_count,
+            "hunt_round": hunt_round,
+            "stage": stage,
+        })
+
+
+def _finalize_hunt(hunt_id: str, accumulated: dict, status: str, *, error: str | None = None) -> None:
+    """Persist a hunt's final state and broadcast completion/failure.
+
+    Unifies the previously near-duplicated completed / cancelled / failed paths.
+    For non-completed statuses the in-memory ``current_stage`` is left untouched.
+    """
+    cost_summary = get_tracker(hunt_id).to_summary()
+    remove_tracker(hunt_id)
+    accumulated["cost_summary"] = cost_summary
+
+    update: dict[str, Any] = {
+        "status": status,
+        "error": error,
+        "completed_at": now_iso(),
+        "cost_summary": cost_summary,
+        "result": accumulated,
+        "leads_count": _unique_leads_count(accumulated.get("leads", [])),
+        "hunt_round": accumulated.get("hunt_round", 0),
+    }
+    if status == "completed":
+        update["current_stage"] = accumulated.get("current_stage", "done")
+
+    _hunts[hunt_id].update(update)
+    save_hunt(hunt_id, _hunts[hunt_id])
+
+    if status == "completed":
+        _broadcast(hunt_id, "completed", {
+            "leads_count": _unique_leads_count(accumulated.get("leads", [])),
+            "email_sequences_count": len(accumulated.get("email_sequences", [])),
+            "hunt_round": accumulated.get("hunt_round", 0),
+        })
+    else:
+        _broadcast(hunt_id, "failed", {"error": error or ""})
+
+
+async def _run_hunt(hunt_id: str, request: HuntRequest) -> None:
+    """Run the full hunt pipeline in the background."""
+    _hunts[hunt_id]["status"] = "running"
+    logger.info(
+        "[Hunt %s] Starting — url=%s, files=%d, desc=%r, keywords=%s, profile=%s, regions=%s, email=%s",
+        hunt_id[:8], request.website_url or "(none)",
+        len(request.uploaded_file_ids),
+        request.description[:60] if request.description else "",
+        request.product_keywords, request.target_customer_profile,
+        request.target_regions, request.enable_email_craft,
+    )
+
+    initial_state = _build_initial_state(request, hunt_id)
+
     # Wire per-URL progress callback → SSE broadcast + incremental disk save
     _throttle_state = {"last_save": 0.0}
-
-    def _on_lead_progress(data: dict) -> None:
-        _broadcast(hunt_id, "lead_progress", data)
-        # Incrementally persist leads as they're found — survives kill -9.
-        # Throttled: save_hunt rewrites the whole hunt JSON, so flush at most
-        # once per _LEAD_SAVE_INTERVAL_SECONDS (authoritative state is still
-        # checkpointed at stage changes and fully flushed at hunt end).
-        if data.get("event") == "lead_found" and data.get("lead"):
-            hunt = _hunts.get(hunt_id)
-            if hunt is not None:
-                result = hunt.setdefault("result", {})
-                leads = result.setdefault("leads", [])
-                leads.append(data["lead"])
-                hunt["leads_count"] = _unique_leads_count(leads)
-                now = time.monotonic()
-                if now - _throttle_state["last_save"] >= _LEAD_SAVE_INTERVAL_SECONDS:
-                    if not save_hunt(hunt_id, hunt):
-                        logger.error("[Hunt %s] Failed to persist incremental leads", hunt_id[:8])
-                    _throttle_state["last_save"] = now
-
-    set_progress_callback(_on_lead_progress)
+    set_progress_callback(lambda data: _on_lead_progress(hunt_id, _throttle_state, data))
 
     # Initialize accumulated BEFORE the try block so exception handlers
     # (cancel / failure paths) can always reference it safely.
@@ -677,129 +779,24 @@ async def _run_hunt(hunt_id: str, request: HuntRequest) -> None:
             email_craft_node=email_craft_node,
         )
 
-        # Use astream to get intermediate state updates and accumulate final result
-        prev_stage = "start"
-        prev_round = 1
-
+        prev = {"stage": "start", "round": 1}
         async for chunk in graph.astream(initial_state):
             _raise_if_hunt_cancelled(hunt_id)
-            # chunk is {node_name: node_output_dict}
-            for node_name, node_output in chunk.items():
-                if node_name == "__end__":
-                    continue
+            _apply_hunt_chunk(hunt_id, chunk, accumulated, prev)
+            _raise_if_hunt_cancelled(hunt_id)
 
-                # Merge node output into accumulated state
-                accumulated.update(node_output)
-
-                stage = node_output.get("current_stage", prev_stage)
-                hunt_round = accumulated.get("hunt_round", prev_round)
-                leads_count = _unique_leads_count(accumulated.get("leads", []))
-                email_count = len(accumulated.get("email_sequences", []))
-
-                # Update in-memory store
-                _hunts[hunt_id].update({
-                    "current_stage": stage,
-                    "hunt_round": hunt_round,
-                    "leads_count": leads_count,
-                    "email_sequences_count": email_count,
-                })
-
-                # Broadcast stage change + stage-specific detail data
-                if stage != prev_stage:
-                    logger.info("[Hunt %s] Stage: %s → %s (round %d, leads %d)",
-                                hunt_id[:8], prev_stage, stage, hunt_round, leads_count)
-                    _broadcast(hunt_id, "stage_change", {
-                        "stage": stage,
-                        "hunt_round": hunt_round,
-                        "leads_count": leads_count,
-                    })
-
-                    # Broadcast detail data for the stage that just completed
-                    _broadcast_stage_data(hunt_id, prev_stage, accumulated)
-
-                    # Checkpoint: persist accumulated state so kill -9 doesn't lose data
-                    _hunts[hunt_id]["result"] = dict(accumulated)
-                    save_hunt(hunt_id, _hunts[hunt_id])
-
-                    prev_stage = stage
-
-                # Broadcast round change
-                if hunt_round != prev_round:
-                    logger.info("[Hunt %s] Round %d → %d", hunt_id[:8], prev_round, hunt_round)
-                    _broadcast(hunt_id, "round_change", {
-                        "hunt_round": hunt_round,
-                    })
-                    prev_round = hunt_round
-
-                # Broadcast progress
-                _broadcast(hunt_id, "progress", {
-                    "leads_count": leads_count,
-                    "email_sequences_count": email_count,
-                    "hunt_round": hunt_round,
-                    "stage": stage,
-                })
-                _raise_if_hunt_cancelled(hunt_id)
-
-        # Stream finished — accumulated has the full merged state
-        cost_summary = get_tracker(hunt_id).to_summary()
-        remove_tracker(hunt_id)
-        accumulated["cost_summary"] = cost_summary
-
-        _hunts[hunt_id].update({
-            "status": "completed",
-            "result": accumulated,
-            "current_stage": accumulated.get("current_stage", "done"),
-            "hunt_round": accumulated.get("hunt_round", 0),
-            "leads_count": _unique_leads_count(accumulated.get("leads", [])),
-            "email_sequences_count": len(accumulated.get("email_sequences", [])),
-            "completed_at": now_iso(),
-            "cost_summary": cost_summary,
-        })
-        save_hunt(hunt_id, _hunts[hunt_id])
-
+        _finalize_hunt(hunt_id, accumulated, "completed")
         logger.info("[Hunt %s] Completed — %d leads, %d email sequences, %d rounds",
                     hunt_id[:8], _unique_leads_count(accumulated.get("leads", [])),
                     len(accumulated.get("email_sequences", [])),
                     accumulated.get("hunt_round", 0))
 
-        _broadcast(hunt_id, "completed", {
-            "leads_count": _unique_leads_count(accumulated.get("leads", [])),
-            "email_sequences_count": len(accumulated.get("email_sequences", [])),
-            "hunt_round": accumulated.get("hunt_round", 0),
-        })
-
     except HuntCancelledError as e:
         logger.warning("[Hunt %s] Cancelled: %s", hunt_id[:8], e)
-        cost_summary = get_tracker(hunt_id).to_summary()
-        remove_tracker(hunt_id)
-        accumulated["cost_summary"] = cost_summary
-        _hunts[hunt_id].update({
-            "status": "cancelled",
-            "error": str(e),
-            "completed_at": now_iso(),
-            "cost_summary": cost_summary,
-            "result": accumulated,
-            "leads_count": _unique_leads_count(accumulated.get("leads", [])),
-            "hunt_round": accumulated.get("hunt_round", 0),
-        })
-        save_hunt(hunt_id, _hunts[hunt_id])
-        _broadcast(hunt_id, "failed", {"error": str(e)})
+        _finalize_hunt(hunt_id, accumulated, "cancelled", error=str(e))
     except Exception as e:
         logger.error("[Hunt %s] Failed: %s", hunt_id[:8], e, exc_info=True)
-        cost_summary = get_tracker(hunt_id).to_summary()
-        remove_tracker(hunt_id)
-        accumulated["cost_summary"] = cost_summary
-        _hunts[hunt_id].update({
-            "status": "failed",
-            "error": str(e),
-            "completed_at": now_iso(),
-            "cost_summary": cost_summary,
-            "result": accumulated,
-            "leads_count": _unique_leads_count(accumulated.get("leads", [])),
-            "hunt_round": accumulated.get("hunt_round", 0),
-        })
-        save_hunt(hunt_id, _hunts[hunt_id])
-        _broadcast(hunt_id, "failed", {"error": str(e)})
+        _finalize_hunt(hunt_id, accumulated, "failed", error=str(e))
     finally:
         set_progress_callback(None)
 
@@ -912,27 +909,7 @@ async def _run_resume_hunt(hunt_id: str, request: ResumeRequest, prior_result: d
     initial_state = _slim_state(prior_result, request)
 
     _throttle_state = {"last_save": 0.0}
-
-    def _on_lead_progress(data: dict) -> None:
-        _broadcast(hunt_id, "lead_progress", data)
-        # Incrementally persist leads as they're found — survives kill -9.
-        # Throttled: save_hunt rewrites the whole hunt JSON, so flush at most
-        # once per _LEAD_SAVE_INTERVAL_SECONDS (authoritative state is still
-        # checkpointed at stage changes and fully flushed at hunt end).
-        if data.get("event") == "lead_found" and data.get("lead"):
-            hunt = _hunts.get(hunt_id)
-            if hunt is not None:
-                result = hunt.setdefault("result", {})
-                leads = result.setdefault("leads", [])
-                leads.append(data["lead"])
-                hunt["leads_count"] = _unique_leads_count(leads)
-                now = time.monotonic()
-                if now - _throttle_state["last_save"] >= _LEAD_SAVE_INTERVAL_SECONDS:
-                    if not save_hunt(hunt_id, hunt):
-                        logger.error("[Hunt %s] Failed to persist incremental leads", hunt_id[:8])
-                    _throttle_state["last_save"] = now
-
-    set_progress_callback(_on_lead_progress)
+    set_progress_callback(lambda data: _on_lead_progress(hunt_id, _throttle_state, data))
 
     # Initialize accumulated BEFORE the try block so exception handlers
     # (cancel / failure paths) can always reference it safely.

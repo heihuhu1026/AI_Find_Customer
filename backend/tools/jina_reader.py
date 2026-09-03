@@ -9,6 +9,7 @@ import httpx
 from tenacity import before_sleep_log, retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 from config.settings import Settings, get_settings
+from tools.http_client_mixin import AsyncHTTPClientMixin
 
 logger = logging.getLogger(__name__)
 
@@ -21,19 +22,15 @@ def _is_retryable_error(exc: BaseException) -> bool:
     return False
 
 
-class JinaReaderTool:
+class JinaReaderTool(AsyncHTTPClientMixin):
     """Fetch clean Markdown from r.jina.ai for a target URL."""
 
     JINA_BASE = "https://r.jina.ai/"
 
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings = settings or get_settings()
+        self._http_timeout = 60.0
         self._client: Optional[httpx.AsyncClient] = None
-
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(timeout=60.0)
-        return self._client
 
     @retry(
         retry=retry_if_exception(_is_retryable_error),

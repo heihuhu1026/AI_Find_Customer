@@ -46,8 +46,11 @@ class SocialEnricher:
         try:
             if self.provider == "apollo":
                 return self._fetch_apollo(domain=domain, linkedin_url=linkedin_url)
-        except Exception as e:  # pragma: no cover — defensive
-            logger.warning("[SocialEnricher] enrichment failed (degrading to {}): %s", e)
+        except Exception:  # pragma: no cover — defensive
+            # NOTE: `{}` and `%s` must not be mixed — logging only interpolates
+            # `%`-style args, so the previous form raised a formatting error
+            # (and, worse, hid the real failure) whenever this branch ran.
+            logger.warning("[SocialEnricher] enrichment failed (degrading to {}): %s", exc_info=True)
         return {}
 
     # ── Apollo ──────────────────────────────────────────────────────────
@@ -69,7 +72,7 @@ class SocialEnricher:
                 timeout=self.timeout,
             )
         except requests.RequestException as e:
-            logger.warning("[SocialEnricher] Apollo request error ({}): %s", e)
+            logger.warning("[SocialEnricher] Apollo request error: %s", e)
             return {}
         if resp.status_code != 200:
             logger.warning("[SocialEnricher] Apollo returned HTTP %s", resp.status_code)

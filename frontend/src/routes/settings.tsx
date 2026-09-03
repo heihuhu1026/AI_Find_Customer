@@ -227,6 +227,8 @@ function SecretInput({
       <button
         type="button"
         onClick={() => setShow((s) => !s)}
+        aria-label={show ? "隐藏密钥" : "显示密钥"}
+        aria-pressed={show}
         className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
       >
         {show ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
@@ -1433,7 +1435,8 @@ export function SettingsPage() {
     onSuccess: () => {
       setSaved(true);
       queryClient.invalidateQueries({ queryKey: ["app-settings"] });
-      setTimeout(() => setSaved(false), 3000);
+      const timer = setTimeout(() => setSaved(false), 3000);
+      return () => clearTimeout(timer);
     },
   });
 
@@ -1451,7 +1454,16 @@ export function SettingsPage() {
   };
 
   const handleSave = () => {
-    saveMutation.mutate(values);
+    // The backend returns masked placeholders (e.g. "sk-a****wxyz") for secret
+    // fields. Save forms are submitted wholesale, so sending a masked value back
+    // would overwrite the real secret with the literal string "****".
+    // Drop every untouched masked field and let the backend keep the stored one.
+    const cleaned: Record<string, string> = {};
+    for (const [key, value] of Object.entries(values)) {
+      if (typeof value === "string" && value.includes("****")) continue;
+      cleaned[key] = value;
+    }
+    saveMutation.mutate(cleaned);
   };
 
   const persistSettings = async (payload: Record<string, string>) => {

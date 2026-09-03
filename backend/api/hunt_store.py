@@ -75,9 +75,10 @@ def load_all_hunts(*, mark_interrupted: bool = False) -> dict[str, dict[str, Any
                 data["status"] = "failed"
                 data["error"] = "Process was interrupted (server restarted)"
                 data["completed_at"] = now_iso()
-                # Persist the updated status so it survives future restarts
-                payload = {"hunt_id": hid, **data}
-                path.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
+                # Persist the updated status so it survives future restarts.
+                # Reuse save_hunt's atomic write (tmp + os.replace) instead of
+                # path.write_text, which could truncate the file on a crash.
+                save_hunt(hid, data)
                 logger.info("[HuntStore] Marked interrupted hunt %s as failed", hid[:8])
             hunts[hid] = data
             logger.debug("[HuntStore] Loaded hunt %s (status=%s)", hid[:8], data.get("status"))

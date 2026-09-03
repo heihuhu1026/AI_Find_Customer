@@ -7,17 +7,26 @@ import os as _os
 from datetime import datetime, timezone
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from config.settings import get_settings
 from config.settings_store import is_configured, read_settings, update_settings
 from automation.notifier import send_feishu_text
 from api.errors import safe_error_detail
+from api.security import require_api_access
 from emailing.imap_client import test_imap_connection
 from emailing.smtp_client import test_smtp_connection
 
-router = APIRouter(prefix="/api/settings", tags=["settings"])
+# This router exposes every secret in .env (read *and* write) plus an
+# outbound-webhook test endpoint. It must never be reachable unauthenticated.
+# Auth in this project is opt-in per route, so the dependency is declared on the
+# router itself — that also covers any endpoint added here in the future.
+router = APIRouter(
+    prefix="/api/settings",
+    tags=["settings"],
+    dependencies=[Depends(require_api_access)],
+)
 
 
 class SettingsPayload(BaseModel):
@@ -280,7 +289,15 @@ async def save_settings(payload: SettingsPayload):
         value = provided_fields[field]
         if isinstance(value, str) and _is_masked(value):
             continue
-        updates[env_key] = str(value)
+        text = str(value)
+        # Values are written into .env unquoted, so an embedded newline would
+        # let a caller append arbitrary settings (credential hijack).
+        if any(char in text for char in ("\n", "\r", "\x00")):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid value for '{field}': newline characters are not allowed.",
+            )
+        updates[env_key] = text
         if field in {"email_from_address", "email_smtp_host", "email_smtp_port", "email_smtp_username", "email_smtp_password", "email_use_tls"}:
             smtp_fields_changed = True
         if field in {"email_imap_host", "email_imap_port", "email_imap_username", "email_imap_password"}:
@@ -407,12 +424,21 @@ async def save_license_token(req: SaveTokenRequest):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+MASK_PLACEHOLDER = "****"
+
+
 def _mask(value: str) -> str:
-    """Partially mask a secret value for display."""
-    if not value or len(value) < 8:
-        return value
-    return value[:4] + "****" + value[-4:]
+    """Return a fixed placeholder for any non-empty value.
+
+    Deliberately reveals **no** characters. The previous implementation kept the
+    first and last 4 characters (and returned short values verbatim), which let
+    an unauthenticated reader identify the key type (``sk-``, ``tvly-``, …) and
+    brute-force the remainder far more cheaply.
+    """
+    if not value:
+        return ""
+    return MASK_PLACEHOLDER
 
 
 def _is_masked(value: str) -> bool:
-    return "****" in value
+    return MASK_PLACEHOLDER in value

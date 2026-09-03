@@ -45,7 +45,6 @@ function ContinueJobDialog({
       setTargetLeadCount(Math.max(currentLeads + 100, 200));
       setMaxRounds(10);
       setMinNewLeadsThreshold(5);
-      setMinNewLeadsThreshold(5);
       setEnableEmailCraft(false);
       setEmailTemplateExamplesText("");
       setEmailTemplateNotes("");
@@ -1582,7 +1581,12 @@ export function HuntDetailPage() {
     };
 
     return () => es.close();
-  }, [huntId, initialLoaded, sse.status]);
+    // NOTE: `sse.status` is intentionally NOT a dependency. The handlers above
+    // update it via functional setSSE, and the connection is closed explicitly
+    // on completed/failed. Including it re-ran this effect on every status
+    // transition, tearing down and reopening the EventSource repeatedly.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [huntId, initialLoaded]);
 
   const exportReport = useCallback(() => {
     const ins = stageData.insight;
@@ -1641,7 +1645,9 @@ export function HuntDetailPage() {
     a.href = url;
     a.download = `hunt-${huntId.slice(0, 8)}-report.txt`;
     a.click();
-    URL.revokeObjectURL(url);
+    // Defer revocation: some browsers fetch the object URL asynchronously after
+    // click(), and revoking immediately would cancel the download.
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }, [stageData, huntId]);
 
   const exportCSV = useCallback(() => {

@@ -6,7 +6,11 @@ from typing import Optional
 
 import httpx
 
-class BraveSearchTool:
+from tools.http_client_mixin import AsyncHTTPClientMixin
+from tools.search_retry import retry_search
+
+
+class BraveSearchTool(AsyncHTTPClientMixin):
     """Search the web via Brave Search API and return structured results.
 
     Each result contains: title, link, snippet, position.
@@ -22,13 +26,10 @@ class BraveSearchTool:
             self._api_key = settings.brave_api_key
         else:
             self._api_key = ""
+        self._http_timeout = 30.0
         self._client: Optional[httpx.AsyncClient] = None
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(timeout=30.0)
-        return self._client
-
+    @retry_search
     async def search(
         self,
         query: str,

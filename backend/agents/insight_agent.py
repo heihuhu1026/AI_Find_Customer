@@ -703,8 +703,8 @@ async def insight_node(state: HuntState) -> dict:
         try:
             await jina.close()
             await google.close()
-        except Exception:
-            pass
+        except Exception as close_err:
+            logger.debug("[InsightAgent] tool close failed: %s", close_err)
 
     return {
         "insight": insight,

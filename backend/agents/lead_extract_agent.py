@@ -110,10 +110,12 @@ def _page_cache_load() -> dict:
         if not _page_cache_mem:
             try:
                 if os.path.exists(_PAGE_CACHE_PATH):
-                    _page_cache_mem = json.load(open(_PAGE_CACHE_PATH, encoding="utf-8"))
+                    with open(_PAGE_CACHE_PATH, encoding="utf-8") as fh:
+                        _page_cache_mem = json.load(fh)
                 else:
                     _page_cache_mem = {}
-            except Exception:
+            except Exception as exc:
+                logger.warning("[LeadExtract] page cache load failed (%s); starting fresh", exc)
                 _page_cache_mem = {}
     return _page_cache_mem
 
@@ -137,9 +139,10 @@ def _page_cache_put(url: str, content: str) -> None:
         c[k] = {"content": content, "ts": int(time.time())}
         try:
             os.makedirs(os.path.dirname(_PAGE_CACHE_PATH), exist_ok=True)
-            json.dump(c, open(_PAGE_CACHE_PATH, "w", encoding="utf-8"))
-        except Exception:
-            pass
+            with open(_PAGE_CACHE_PATH, "w", encoding="utf-8") as fh:
+                json.dump(c, fh)
+        except Exception as exc:
+            logger.warning("[LeadExtract] page cache write failed: %s", exc)
 
 
 # In-memory result caches for deterministic-ish LLM calls (D2)
@@ -175,7 +178,8 @@ def _seed_domains_from_hunts() -> set:
             try:
                 with open(os.path.join(hunts_dir, fname), encoding="utf-8") as fh:
                     data = json.load(fh)
-            except Exception:
+            except Exception as exc:
+                logger.debug("[LeadExtract] skipping unreadable hunt file %s: %s", fname, exc)
                 continue
             for lead in (data.get("leads") or []):
                 if not isinstance(lead, dict):
@@ -183,8 +187,8 @@ def _seed_domains_from_hunts() -> set:
                 d = _official_website_domain(lead.get("website", ""))
                 if d:
                     domains.add(d)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("[LeadExtract] seeding global dedup from hunts failed: %s", exc)
     return domains
 
 
@@ -210,7 +214,8 @@ def _global_crawled_domains_load() -> set:
                         os.makedirs(os.path.dirname(_GLOBAL_DEDUP_PATH), exist_ok=True)
                         with open(_GLOBAL_DEDUP_PATH, "w", encoding="utf-8") as fh:
                             json.dump({"domains": sorted(domains)}, fh)
-            except Exception:
+            except Exception as exc:
+                logger.warning("[LeadExtract] global dedup load failed; starting empty: %s", exc)
                 domains = set()
             _global_crawled_domains_mem = domains
     return _global_crawled_domains_mem
@@ -1170,6 +1175,27 @@ def _build_react_tools(
         except Exception as e:
             return json.dumps({"error": f"LLM assessment failed: {e}", "match_score": 0.3})
 
+    return _build_react_tool_defs(
+        tool_scrape_page,
+        tool_google_search,
+        tool_extract_lead_info,
+        tool_find_customs_data,
+        tool_assess_lead_fit,
+    )
+
+
+def _build_react_tool_defs(
+    tool_scrape_page,
+    tool_google_search,
+    tool_extract_lead_info,
+    tool_find_customs_data,
+    tool_assess_lead_fit,
+) -> list:
+    """Build the declarative ReAct tool list for lead extraction.
+
+    Extracted from ``_build_react_tools`` (which only wires the closures) so the
+    two concerns stay separate and the tool definitions can be read in one place.
+    """
     return [
         ToolDef(
             name="scrape_page",

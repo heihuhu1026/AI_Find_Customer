@@ -74,7 +74,9 @@ export function DashboardPage() {
   const templateSeedWorker = automationStatus?.workers?.template_seed;
   const dashboardErrors = [jobsError, statusError, metricsError].filter(Boolean) as Error[];
   const feishuWebhook = settings?.settings?.AUTOMATION_FEISHU_WEBHOOK_URL || "";
-  const feishuConfigured = Boolean(feishuWebhook && !feishuWebhook.includes("****") ? feishuWebhook : feishuWebhook.includes("****"));
+  // A masked placeholder still means "configured" — the backend only masks
+  // values it actually has. The previous ternary was a tautology.
+  const feishuConfigured = Boolean(feishuWebhook);
   const summaryEnabled = (settings?.settings?.AUTOMATION_SUMMARY_ENABLED || "true") === "true";
   const alertsEnabled = (settings?.settings?.AUTOMATION_ALERTS_ENABLED || "true") === "true";
   const showFailed = eventFilter === "all" || eventFilter === "failed";

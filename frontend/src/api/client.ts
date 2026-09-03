@@ -1,15 +1,22 @@
 const API_BASE = "/api/v1";
-const API_ACCESS_TOKEN = import.meta.env.VITE_API_ACCESS_TOKEN?.trim() ?? "";
 const API_TIMEOUT_MS = 15000;
+const UPLOAD_TIMEOUT_MS = 120000;
 
-function withApiAuth(headers?: HeadersInit): HeadersInit {
-  if (!API_ACCESS_TOKEN) {
-    return headers ?? {};
+// NOTE: no API key is held by the frontend on purpose.
+// A `VITE_`-prefixed env var is statically inlined into the production bundle by
+// Vite, which would publish the backend API key to anyone who opens DevTools.
+// Authentication is expected to be provided by the same-origin deployment
+// (reverse proxy header injection or a same-site cookie), never from JS.
+export class ApiError extends Error {
+  readonly status: number;
+  readonly detail: string;
+
+  constructor(status: number, detail: string) {
+    super(detail || `Request failed with status ${status}`);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
   }
-  return {
-    ...(headers ?? {}),
-    "X-API-Key": API_ACCESS_TOKEN,
-  };
 }
 const SETTINGS_API_BASE = "/api/settings";
 
@@ -571,27 +578,49 @@ export interface AutomationMetrics {
   }>;
 }
 
-async function requestSettings<T>(path: string, options?: RequestInit): Promise<T> {
+/**
+ * Single fetch wrapper shared by every endpoint.
+ *
+ * - Always applies a timeout (via AbortController) so a hung request can never
+ *   leave the UI stuck in a loading state.
+ * - Leaves `Content-Type` unset for FormData so the browser can add the
+ *   multipart boundary itself.
+ * - Throws `ApiError` (carrying `status`) instead of a bare `Error`, so callers
+ *   can distinguish 401/403 from network failures and 5xx.
+ */
+async function requestCore<T>(
+  base: string,
+  path: string,
+  options?: RequestInit,
+  timeoutMs: number = API_TIMEOUT_MS,
+): Promise<T> {
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  const isFormData =
+    typeof FormData !== "undefined" && options?.body instanceof FormData;
+
   let res: Response;
   try {
-    res = await fetch(`${SETTINGS_API_BASE}${path}`, {
-      headers: { "Content-Type": "application/json" },
+    res = await fetch(`${base}${path}`, {
       ...options,
+      headers: {
+        ...(isFormData ? {} : { "Content-Type": "application/json" }),
+        ...(options?.headers ?? {}),
+      },
       signal: controller.signal,
     });
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") {
-      throw new Error(`Request timed out after ${API_TIMEOUT_MS / 1000}s`);
+      throw new Error(`Request timed out after ${timeoutMs / 1000}s`);
     }
     throw error;
   } finally {
     window.clearTimeout(timeout);
   }
+
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || res.statusText);
+    throw new ApiError(res.status, err.detail || res.statusText);
   }
   if (res.status === 204) {
     return undefined as T;
@@ -599,29 +628,12 @@ async function requestSettings<T>(path: string, options?: RequestInit): Promise<
   return res.json();
 }
 
+async function requestSettings<T>(path: string, options?: RequestInit): Promise<T> {
+  return requestCore<T>(SETTINGS_API_BASE, path, options);
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
-  let res: Response;
-  try {
-    res = await fetch(`${API_BASE}${path}`, {
-      headers: withApiAuth({ "Content-Type": "application/json" }),
-      ...options,
-      signal: controller.signal,
-    });
-  } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
-      throw new Error(`Request timed out after ${API_TIMEOUT_MS / 1000}s`);
-    }
-    throw error;
-  } finally {
-    window.clearTimeout(timeout);
-  }
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || res.statusText);
-  }
-  return res.json();
+  return requestCore<T>(API_BASE, path, options);
 }
 
 export const api = {
@@ -644,8 +656,9 @@ export const api = {
     request<AutomationJob>(`/automation/jobs/${jobId}`),
 
   streamAutomationJob: (jobId: string) => {
-    const suffix = API_ACCESS_TOKEN ? `?api_key=${encodeURIComponent(API_ACCESS_TOKEN)}` : "";
-    const url = `${API_BASE}/automation/jobs/${jobId}/stream${suffix}`;
+    // No api_key in the URL: query strings leak into access logs / Referer /
+    // browser history. Auth is expected to come from the same-origin cookie.
+    const url = `${API_BASE}/automation/jobs/${jobId}/stream`;
     return new EventSource(url);
   },
 
@@ -685,17 +698,15 @@ export const api = {
   uploadFiles: async (files: File[]): Promise<UploadedFile[]> => {
     const formData = new FormData();
     files.forEach((f) => formData.append("files", f));
-    const res = await fetch(`${API_BASE}/upload`, {
-      method: "POST",
-      body: formData,
-      headers: withApiAuth(),
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: res.statusText }));
-      throw new Error(err.detail || res.statusText);
-    }
-    const data = await res.json();
-    return data.uploaded as UploadedFile[];
+    // Uploads need a longer budget than the default 15s and must go through
+    // requestCore so a stalled upload aborts instead of hanging the UI forever.
+    const data = await requestCore<{ uploaded: UploadedFile[] }>(
+      API_BASE,
+      "/upload",
+      { method: "POST", body: formData },
+      UPLOAD_TIMEOUT_MS,
+    );
+    return data.uploaded;
   },
 
   resumeHunt: (huntId: string, data: ResumeRequest) =>
@@ -776,8 +787,8 @@ export const api = {
     request<EmailSequenceDetail>(`/email-sequences/${sequenceId}`),
 
   streamHunt: (huntId: string) => {
-    const suffix = API_ACCESS_TOKEN ? `?api_key=${encodeURIComponent(API_ACCESS_TOKEN)}` : "";
-    const url = `${API_BASE}/hunts/${huntId}/stream${suffix}`;
+    // See streamAutomationJob: never put credentials in the query string.
+    const url = `${API_BASE}/hunts/${huntId}/stream`;
     return new EventSource(url);
   },
 

@@ -7,22 +7,21 @@ from typing import Optional
 import httpx
 
 from config.settings import Settings, get_settings
+from tools.http_client_mixin import AsyncHTTPClientMixin
+from tools.search_retry import retry_search
 
 
-class GoogleMapsSearchTool:
+class GoogleMapsSearchTool(AsyncHTTPClientMixin):
     """Search Google Maps through Serper and return normalized place results."""
 
     SERPER_MAPS_URL = "https://google.serper.dev/maps"
 
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings = settings or get_settings()
+        self._http_timeout = 30.0
         self._client: Optional[httpx.AsyncClient] = None
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(timeout=30.0)
-        return self._client
-
+    @retry_search
     async def search(
         self,
         query: str,

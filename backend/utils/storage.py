@@ -148,25 +148,73 @@ def update_lead(hunt_id: str, lead_key: str, patch: dict[str, Any]) -> dict[str,
     return None
 
 
+# Cache of contacted domains built from all hunts' email_sequences.
+# `has_contacted_before` was originally called once per candidate lead and
+# re-read + parsed *every* hunt JSON each time — O(N×M) disk reads. Now the
+# index is rebuilt only when the hunts directory actually changes.
+_contacted_cache_lock = threading.Lock()
+_contacted_cache_domains: set[str] = set()
+_contacted_cache_mtime: float = -1.0
+
+
+def _hunts_dir_mtime() -> float:
+    """Max mtime of files in the hunts dir (0 if empty/missing)."""
+    d = Path(get_settings().hunts_dir)
+    if not d.is_dir():
+        return -1.0
+    mtime = -1.0
+    for f in d.iterdir():
+        if f.is_file():
+            try:
+                mtime = max(mtime, f.stat().st_mtime)
+            except OSError:
+                pass
+    return mtime
+
+
+def _refresh_contacted_cache() -> set[str]:
+    global _contacted_cache_domains, _contacted_cache_mtime
+    mtime = _hunts_dir_mtime()
+    if mtime == _contacted_cache_mtime:
+        return _contacted_cache_domains
+    domains: set[str] = set()
+    for hunt in load_all_hunts().values():
+        result = hunt.get("result") or {}
+        for sequence in (result.get("email_sequences") or []):
+            if not isinstance(sequence, dict):
+                continue
+            lead = sequence.get("lead") or {}
+            d = _lead_key_domain(str(lead.get("website") or ""))
+            if d:
+                domains.add(d)
+    _contacted_cache_domains = domains
+    _contacted_cache_mtime = mtime
+    return domains
+
+
 def has_contacted_before(domain: str) -> bool:
     """Best-effort: whether ``domain`` already has generated email sequences.
 
     The authoritative "already emailed" state lives in the SQLite EmailStore;
     this helper scans persisted hunt results instead so it stays dependency-free.
+    The scanned domain index is memoized until the hunts directory changes.
     """
     needle = _lead_key_domain(domain)
     if not needle:
         return False
-    for hunt in load_all_hunts().values():
-        result = hunt.get("result") or {}
-        sequences = result.get("email_sequences") or []
-        for sequence in sequences:
-            if not isinstance(sequence, dict):
-                continue
-            lead = sequence.get("lead") or {}
-            if _lead_key_domain(str(lead.get("website") or "")) == needle:
-                return True
-    return False
+    with _contacted_cache_lock:
+        domains = _refresh_contacted_cache()
+        return needle in domains
+
+
+def invalidate_contacted_cache() -> None:
+    """Force the next ``has_contacted_before`` call to rebuild its index.
+
+    Call after writing new email_sequences so freshly-added contacts are seen.
+    """
+    with _contacted_cache_lock:
+        global _contacted_cache_mtime
+        _contacted_cache_mtime = -1.0
 
 
 # ── Blacklists ──────────────────────────────────────────────────────────
