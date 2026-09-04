@@ -163,6 +163,15 @@ def should_continue_hunting(state: HuntState) -> str:
     current_round = state.get("hunt_round", 1)
     max_rounds = state.get("max_rounds", 10)
 
+    # If every search provider failed this round, no leads can be discovered
+    # regardless of further rounds — stop hunting instead of burning LLM calls.
+    if state.get("search_failed"):
+        logger.warning(
+            "[Evaluate] FINISH — all search providers failed; no leads can be discovered "
+            "(error: %s)", state.get("search_error", "")[:200]
+        )
+        return "finish"
+
     # Read new_leads_this_round from round_feedback (computed by evaluate_progress
     # BEFORE prev_round_lead_count was updated).  Fallback to re-computing only
     # if round_feedback is missing (e.g. first invocation).

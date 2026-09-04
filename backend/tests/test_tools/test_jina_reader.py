@@ -12,7 +12,7 @@ _FAKE_REQUEST = httpx.Request("GET", "https://r.jina.ai/https://example.com")
 
 
 def _make_settings(**overrides) -> Settings:
-    defaults = {"jina_api_key": "jina-test-key"}
+    defaults = {"jina_api_key": "jina-test-key", "crawl_dedup_enabled": False}
     defaults.update(overrides)
     return Settings(**defaults)
 

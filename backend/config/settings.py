@@ -93,6 +93,28 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 4096
     llm_requests_per_minute: int = 0
 
+    # --- LLM token-optimization controls (see tools/llm_client.py) ---
+    # Cheap/fast model for simple tasks (classification, keyword/field extraction).
+    # Empty => falls back to llm_model, so behaviour is unchanged until you point
+    # it at a small model or a local server (e.g. "ollama/llama3",
+    # "groq/llama-3.1-8b-instant"). Set this to route simple tasks OFF the
+    # expensive reasoning model. Also used as the FINAL fallback (兜底) when all
+    # cloud models are rate-limited / out of quota.
+    cheap_model: str = ""
+    # Model fallback chain (comma-separated litellm names). When the primary model
+    # is rate-limited or runs out of quota ("缺少流量"), the client auto-jumps to
+    # the next model here, then finally to `cheap_model` (local Ollama) as 兜底.
+    # Bare names (no "/") are auto-prefixed with "dashscope/".
+    llm_model_fallback: str = ""
+    reasoning_model_fallback: str = ""
+    # In-memory response cache: identical prompts (temperature==0) are served
+    # from cache, skipping the LLM call entirely (0 tokens).
+    llm_cache_enabled: bool = True
+    llm_cache_ttl_seconds: int = 60 * 60 * 24 * 7  # 7 days
+    # Hard cap on prompt+system characters sent to the model. Over-long inputs
+    # are head/tail trimmed to avoid runaway token spend. 0 = no cap.
+    llm_max_input_chars: int = 16000
+
     # Reasoning model — used for ReAct agent decision-making (stronger reasoning)
     #   e.g. "gpt-4o", "anthropic/claude-3-5-sonnet-20241022", "openrouter/deepseek/deepseek-r1"
     reasoning_model: str = "gpt-4o"
@@ -109,6 +131,10 @@ class Settings(BaseSettings):
     moonshot_api_key: str = ""    # Kimi / Moonshot AI
     minimax_api_key: str = ""
     minimax_api_base: str = "https://api.minimax.io/v1"
+    # 百炼 / 阿里云 DashScope (qwen3.8 / kimi-k3 等模型均走此网关)
+    dashscope_api_key: str = ""
+    # 本地 Ollama 服务地址 (小模型 / 兜底)
+    ollama_api_base: str = "http://127.0.0.1:11434"
     email_openai_api_key: str = ""
     email_anthropic_api_key: str = ""
     email_openrouter_api_key: str = ""
@@ -121,6 +147,15 @@ class Settings(BaseSettings):
     serper_api_key: str = ""
     tavily_api_key: str = ""      # supports multiple keys: "key1,key2"
     jina_api_key: str = ""
+    brave_api_key: str = ""       # Brave Search API (optional; see tools/brave_search.py)
+    exa_api_key: str = ""         # Exa AI (semantic web search; see tools/exa_search.py)
+    parallel_api_key: str = ""    # Parallel AI Search (see tools/parallel_search.py)
+    serpapi_api_key: str = ""     # SerpApi (Google web search; see tools/serpapi_search.py)
+    # Comma-separated ordered list of web/maps search providers used by
+    # search_agent's sequential failover chain (highest priority first).
+    # Leave empty to use the built-in default order in agents/search_agent.py.
+    # Example: SEARCH_PROVIDER_ORDER=serpapi,exa,brave,google_maps,tavily,parallel
+    search_provider_order: str = ""
 
     # --- Email ---
     email_provider_type: str = "smtp"
@@ -222,6 +257,25 @@ class Settings(BaseSettings):
     automation_consumer_status_poll_seconds: int = 15
     automation_consumer_request_timeout_seconds: int = 60
     automation_consumer_auto_start_campaign: bool = True
+
+    # --- Crawl de-duplication (unified cross-hunt URL registry) ---
+    # When enabled, the same website is crawled at most once per freshness
+    # window across ALL hunts (see tools/crawl_registry.py). This removes the
+    # previous per-hunt-only, duplicated de-dup logic.
+    crawl_dedup_enabled: bool = True
+    crawl_dedup_ttl_seconds: int = 60 * 60 * 24 * 30  # 30-day freshness window
+    crawl_registry_db_path: str = _resolve_file("data/crawl_registry.db")
+    # Refuse to enqueue a task whose target website was already crawled.
+    # Set False to only WARN (still enqueue). Force re-run via force=true.
+    automation_block_duplicate_target_site: bool = True
+
+    # --- Blacklist (customers excluded from crawling across all hunts) ---
+    # Persistent store shared by the crawl pipeline (see tools/blacklist_store.py).
+    blacklist_db_path: str = _resolve_file("data/blacklist.db")
+    # When True, search results / crawl targets matching a blacklisted domain
+    # are dropped at the earliest pipeline stage. Disable to only keep the
+    # final lead-extraction guard.
+    blacklist_filter_enabled: bool = True
 
     # --- Hunt persistence ---
     hunts_dir: str = _resolve_dir("data/hunts")  # directory for JSON hunt files

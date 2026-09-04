@@ -1,6 +1,6 @@
-import { useState, useRef } from "react";
+import { useEffect, useState, useRef } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { useNavigate } from "@tanstack/react-router";
+import { useNavigate, useSearch } from "@tanstack/react-router";
 import { api, UploadedFile } from "@/api/client";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -10,6 +10,7 @@ import { Badge } from "@/components/ui/badge";
 
 export function NewHuntPage() {
   const navigate = useNavigate();
+  const { fromJob } = useSearch({ from: "/hunts/new" });
   const [description, setDescription] = useState("");
   const [websiteUrl, setWebsiteUrl] = useState("");
   const [keywordInput, setKeywordInput] = useState("");
@@ -32,6 +33,31 @@ export function NewHuntPage() {
     queryFn: api.getSettings,
     retry: false,
   });
+
+  // ── Copy-as-template: prefill the form from an existing job's payload ──
+  const copySourceQuery = useQuery({
+    queryKey: ["automation-job", fromJob],
+    queryFn: () => api.getAutomationJob(fromJob),
+    enabled: Boolean(fromJob),
+  });
+
+  useEffect(() => {
+    const job = copySourceQuery.data;
+    if (!job) return;
+    setDescription(job.description ?? "");
+    setWebsiteUrl(job.website_url ?? "");
+    setKeywords(job.product_keywords ?? []);
+    setTargetCustomerProfile(job.target_customer_profile ?? "");
+    setRegions(job.target_regions ?? []);
+    setTargetLeadCount(job.target_lead_count ?? 200);
+    setMaxRounds(job.max_rounds ?? 10);
+    setMinNewLeadsThreshold(job.min_new_leads_threshold ?? 5);
+    setEnableEmailCraft(job.enable_email_craft ?? false);
+    setEmailTemplateExamplesText((job.email_template_examples ?? []).join("\n\n"));
+    setEmailTemplateNotes(job.email_template_notes ?? "");
+    // Uploaded files are referenced by file_id and cannot be re-attached to a
+    // new job; the user can re-upload if needed.
+  }, [copySourceQuery.data]);
 
   const createHunt = useMutation({
     mutationFn: api.createAutomationJob,
@@ -133,8 +159,12 @@ export function NewHuntPage() {
   return (
     <div className="max-w-2xl mx-auto">
       <div className="mb-8">
-        <h1 className="text-3xl font-bold tracking-tight">新建任务</h1>
-        <p className="text-muted-foreground mt-1">提交到任务队列后会立即进入执行详情页，先准备模板 seed，再由 consumer 持续挖掘并交给发送队列</p>
+        <h1 className="text-3xl font-bold tracking-tight">{fromJob ? "复制任务" : "新建任务"}</h1>
+        <p className="text-muted-foreground mt-1">
+          {fromJob
+            ? `已从任务 ${fromJob} 复制参数，可修改后直接提交为新任务。`
+            : "提交到任务队列后会立即进入执行详情页，先准备模板 seed，再由 consumer 持续挖掘并交给发送队列"}
+        </p>
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-6">

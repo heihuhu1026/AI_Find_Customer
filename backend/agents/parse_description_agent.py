@@ -28,36 +28,7 @@ from tools.llm_client import LLMTool
 
 logger = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = """You are a B2B lead hunting assistant. A user has typed a free-form description
-of what they want to find. Your job is to extract structured parameters from this description.
-
-Extract the following fields:
-- target_regions: list of geographic regions/countries/cities mentioned or implied
-- target_customer_profile: description of the ideal customer type (business role, industry)
-- product_keywords: list of specific products or services mentioned
-- company_name: company name if mentioned (empty string if not)
-- description_insight: 1-2 sentence summary of what was understood (in English)
-
-## Rules
-- target_regions: be specific. "东南亚" → ["Southeast Asia"], "南美" → ["South America"],
-  "巴西" → ["Brazil"], "全球" → ["Global"]. If no region mentioned, return [].
-- target_customer_profile: capture the customer TYPE, not the user's own company.
-  "找旅行社" → "travel agencies and tour operators"
-  "找经销商" → "distributors and resellers"
-  "找进口商" → "importers and trading companies"
-  If already detailed in the description, use the full description.
-- product_keywords: specific products/services. "LED灯" → ["LED lighting"], "太阳能板" → ["solar panels"].
-  If no specific product mentioned, return [].
-- Always output in this exact JSON format, no markdown fences.
-
-Output JSON:
-{
-  "target_regions": ["..."],
-  "target_customer_profile": "...",
-  "product_keywords": ["..."],
-  "company_name": "...",
-  "description_insight": "..."
-}"""
+from tools.prompts import PARSE_DESCRIPTION_SYSTEM as _SYSTEM_PROMPT
 
 
 async def parse_description_node(state: HuntState) -> dict:
@@ -74,6 +45,7 @@ async def parse_description_node(state: HuntState) -> dict:
     updates: dict = {"current_stage": "parse_description"}
 
     llm = LLMTool(
+        model_type="cheap",
         hunt_id=state.get("hunt_id", ""),
         agent="parse_description",
         hunt_round=0,
@@ -84,6 +56,7 @@ async def parse_description_node(state: HuntState) -> dict:
             description,
             system=_SYSTEM_PROMPT,
             temperature=0.1,
+            max_tokens=600,
             response_format={"type": "json_object"},
         )
 

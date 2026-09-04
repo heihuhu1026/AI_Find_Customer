@@ -411,9 +411,14 @@ type EmailProviderPreset = {
 };
 
 const SEARCH_FIELDS: FieldDef[] = [
+  { key: "serper_api_key", label: "Serper API Key", placeholder: "", secret: true, hint: "Google Maps 搜索" },
+  { key: "serpapi_api_key", label: "SerpApi API Key", placeholder: "", secret: true, hint: "Google 网页搜索（100 次/月免费）" },
+  { key: "brave_api_key", label: "Brave API Key", placeholder: "", secret: true, hint: "通用网页搜索" },
+  { key: "exa_api_key", label: "Exa AI API Key", placeholder: "", secret: true, hint: "语义网页搜索（按次计费）" },
   { key: "tavily_api_key", label: "Tavily API Key", placeholder: "tvly-…（多 Key 用逗号分隔）", secret: true, hint: "通用网页搜索，支持多 Key：key1,key2" },
-  { key: "serper_api_key", label: "Serper API Key", placeholder: "", secret: true, hint: "Google Maps 搜索及部分网页补充查询" },
+  { key: "parallel_api_key", label: "Parallel AI API Key", placeholder: "", secret: true, hint: "Parallel 搜索（需账户余额）" },
   { key: "jina_api_key", label: "Jina Reader API Key", placeholder: "", secret: true, hint: "网页读取与抓取" },
+  { key: "search_provider_order", label: "搜索 Provider 优先级", placeholder: "brave,serpapi,exa,google_maps,tavily,parallel", hint: "逗号分隔，先尝试在前；留空用内置默认。每个关键词按此顺序尝试，额度用完自动切下一个。" },
   { key: "amap_api_key", label: "Amap API Key（高德）", placeholder: "", secret: true, hint: "中国区域地图搜索" },
   { key: "baidu_api_key", label: "Baidu API Key（百度）", placeholder: "", secret: true, hint: "中国区域网页搜索" },
 ];
@@ -1168,8 +1173,13 @@ export function SettingsPage() {
         EMAIL_MOONSHOT_API_KEY: "email_moonshot_api_key",
         EMAIL_MINIMAX_API_KEY: "email_minimax_api_key",
         SERPER_API_KEY: "serper_api_key",
+        SERPAPI_API_KEY: "serpapi_api_key",
+        BRAVE_API_KEY: "brave_api_key",
+        EXA_API_KEY: "exa_api_key",
         TAVILY_API_KEY: "tavily_api_key",
+        PARALLEL_API_KEY: "parallel_api_key",
         JINA_API_KEY: "jina_api_key",
+        SEARCH_PROVIDER_ORDER: "search_provider_order",
         AMAP_API_KEY: "amap_api_key",
         BAIDU_API_KEY: "baidu_api_key",
         HUNTER_API_KEY: "hunter_api_key",

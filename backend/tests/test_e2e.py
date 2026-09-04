@@ -5,7 +5,8 @@ Insight → KeywordGen → Search → LeadExtract → Evaluate → (loop or fini
 """
 
 import json
-from unittest.mock import AsyncMock, patch, MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -97,6 +98,25 @@ FAKE_EMAIL_SEQUENCE = json.dumps({
 })
 
 
+def _search_settings():
+    """Settings used by search_node during E2E: only maps+tavily enabled.
+
+    Provider order is forced so that both mocked backends are reachable while
+    every other provider (brave/exa/serpapi/parallel) stays disabled, avoiding
+    any real network call in tests.
+    """
+    return SimpleNamespace(
+        search_concurrency=5,
+        search_provider_order="google_maps,tavily",
+        serper_api_key="test-serper",
+        tavily_api_key="tvly-test",
+        brave_api_key="",
+        exa_api_key="",
+        serpapi_api_key="",
+        parallel_api_key="",
+    )
+
+
 def _initial_state():
     """Minimal initial state to feed into the graph."""
     return {
@@ -166,6 +186,10 @@ class TestE2EPipeline:
                 return FAKE_LEAD_VALID
             elif "email copywriter" in system.lower():
                 return FAKE_EMAIL_SEQUENCE
+            elif "email editor" in system.lower() or "communication validator" in system.lower():
+                # EmailCraft rewriter / locale-validator direct LLM calls: feed the
+                # same fake sequence back so validation+revision completes.
+                return FAKE_EMAIL_SEQUENCE
             else:
                 return json.dumps({"result": "unknown"})
 
@@ -177,7 +201,6 @@ class TestE2EPipeline:
              patch("agents.keyword_gen_agent.get_settings") as mock_kw_settings, \
              patch("agents.search_agent.WebSearchTool") as MockSearch, \
              patch("agents.search_agent.GoogleMapsSearchTool") as MockMaps, \
-             patch("agents.search_agent.PlatformRegistryTool") as MockPlatform, \
              patch("agents.search_agent.get_settings") as mock_search_settings, \
              patch("agents.lead_extract_agent.JinaReaderTool") as MockJinaLead, \
              patch("agents.lead_extract_agent.LLMTool") as MockLLMLead, \
@@ -200,12 +223,12 @@ class TestE2EPipeline:
             MockLLMKeyword.return_value = llm_keyword
 
             # ── SearchAgent mocks ───────────────────────────────────────
-            mock_search_settings.return_value.search_concurrency = 5
+            mock_search_settings.return_value = _search_settings()
 
             search_inst = AsyncMock()
             search_inst.search = AsyncMock(side_effect=_make_search_results)
             search_inst.close = AsyncMock()
-            search_inst.backend = "brave"
+            search_inst.backend = "tavily"
             MockSearch.return_value = search_inst
 
             maps_inst = AsyncMock()
@@ -224,11 +247,6 @@ class TestE2EPipeline:
             ])
             maps_inst.close = AsyncMock()
             MockMaps.return_value = maps_inst
-
-            platform_inst = MagicMock()
-            platform_inst.build_queries = MagicMock(return_value=[])
-            platform_inst.match = MagicMock(return_value=[])
-            MockPlatform.return_value = platform_inst
 
             # ── LeadExtractAgent mocks ──────────────────────────────────
             mock_lead_settings.return_value.scrape_concurrency = 5
@@ -311,7 +329,6 @@ class TestE2EPipeline:
              patch("agents.keyword_gen_agent.get_settings") as mock_kw_settings, \
              patch("agents.search_agent.WebSearchTool") as MockSearch, \
              patch("agents.search_agent.GoogleMapsSearchTool") as MockMaps2, \
-             patch("agents.search_agent.PlatformRegistryTool") as MockPlatform, \
              patch("agents.search_agent.get_settings") as mock_search_settings, \
              patch("agents.lead_extract_agent.JinaReaderTool") as MockJinaLead, \
              patch("agents.lead_extract_agent.LLMTool") as MockLLMLead, \
@@ -333,22 +350,17 @@ class TestE2EPipeline:
             MockLLMKeyword.return_value = llm_keyword
 
             # SearchAgent
-            mock_search_settings.return_value.search_concurrency = 5
+            mock_search_settings.return_value = _search_settings()
             search_inst = AsyncMock()
             search_inst.search = AsyncMock(side_effect=_make_search_results)
             search_inst.close = AsyncMock()
-            search_inst.backend = "brave"
+            search_inst.backend = "tavily"
             MockSearch.return_value = search_inst
 
             maps_inst2 = AsyncMock()
             maps_inst2.search = AsyncMock(return_value=[])
             maps_inst2.close = AsyncMock()
             MockMaps2.return_value = maps_inst2
-
-            platform_inst = MagicMock()
-            platform_inst.build_queries = MagicMock(return_value=[])
-            platform_inst.match = MagicMock(return_value=[])
-            MockPlatform.return_value = platform_inst
 
             # LeadExtractAgent — all leads invalid
             mock_lead_settings.return_value.scrape_concurrency = 5

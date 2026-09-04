@@ -10,10 +10,16 @@ export default defineConfig({
     },
   },
   server: {
+    // Bind explicitly to IPv4 loopback. Without this Vite binds to IPv6 (::1)
+    // only, while the backend (uvicorn) listens on IPv4 127.0.0.1 — browsers
+    // that resolve localhost to 127.0.0.1 then hang/fail.
+    host: "127.0.0.1",
     port: 3000,
     proxy: {
       "/api": {
-        target: "http://localhost:8000",
+        // 127.0.0.1 (not "localhost") so the proxy never resolves to ::1,
+        // which the IPv4-only backend does not listen on.
+        target: "http://127.0.0.1:8000",
         changeOrigin: true,
       },
     },

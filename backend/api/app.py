@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.automation_routes import router as automation_router
+from api.blacklist_routes import router as blacklist_router
 from api.hunt_store import load_all_hunts
 from api.email_routes import (
     CreateCampaignRequest,
@@ -741,6 +742,7 @@ def create_app() -> FastAPI:
     app.include_router(router, prefix="/api/v1")
     app.include_router(automation_router)
     app.include_router(email_router)
+    app.include_router(blacklist_router)
     app.include_router(sse_router, prefix="/api/v1")
     if settings.settings_api_enabled:
         app.include_router(settings_router)

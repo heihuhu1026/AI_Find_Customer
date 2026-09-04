@@ -385,3 +385,84 @@ class TestLLMToolLifecycle:
     async def test_close_is_noop(self):
         tool = LLMTool(settings=_make_settings())
         await tool.close()  # Should not raise
+
+
+class TestLLMToolCache:
+    """Deterministic cache is the biggest token saver: identical prompts are
+    served from memory, skipping the LLM call entirely (0 tokens)."""
+
+    @pytest.mark.asyncio
+    async def test_deterministic_cache_skips_second_call(self):
+        settings = _make_settings(llm_cache_enabled=True, llm_cache_ttl_seconds=600)
+        tool = LLMTool(settings=settings)
+        mock_resp = _mock_completion("cached answer")
+        with patch("tools.llm_client.litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp) as mock_call:
+            r1 = await tool.generate("same prompt", temperature=0.0)
+            r2 = await tool.generate("same prompt", temperature=0.0)
+        assert r1 == r2 == "cached answer"
+        # Second identical (temperature==0) call hits cache -> no second LLM call.
+        mock_call.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_cache_spans_instances_same_process(self):
+        # Two different hunts (different LLMTool instances) sharing one process
+        # still benefit from the process-wide cache for identical work.
+        settings = _make_settings(llm_cache_enabled=True, llm_cache_ttl_seconds=600)
+        mock_resp = _mock_completion("shared")
+        with patch("tools.llm_client.litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp) as mock_call:
+            await LLMTool(settings=settings).generate("parse this site", temperature=0.0)
+            await LLMTool(settings=settings, hunt_id="other-hunt").generate("parse this site", temperature=0.0)
+        mock_call.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_cache_disabled_for_nonzero_temperature(self):
+        settings = _make_settings(llm_cache_enabled=True, llm_cache_ttl_seconds=600)
+        tool = LLMTool(settings=settings)
+        mock_resp = _mock_completion("x")
+        with patch("tools.llm_client.litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp) as mock_call:
+            await tool.generate("p", temperature=0.7)
+            await tool.generate("p", temperature=0.7)
+        assert mock_call.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_cache_can_be_forced(self):
+        settings = _make_settings(llm_cache_enabled=True, llm_cache_ttl_seconds=600)
+        tool = LLMTool(settings=settings)
+        mock_resp = _mock_completion("y")
+        with patch("tools.llm_client.litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp) as mock_call:
+            await tool.generate("p", temperature=0.7, cache=True)
+            await tool.generate("p", temperature=0.7, cache=True)
+        mock_call.assert_called_once()
+
+
+class TestLLMToolInputTruncation:
+    @pytest.mark.asyncio
+    async def test_prompt_truncated_to_max_input_chars(self):
+        settings = _make_settings(llm_max_input_chars=50)
+        tool = LLMTool(settings=settings)
+        mock_resp = _mock_completion("ok")
+        big = "ABCDEFGH" * 200  # 1600 chars
+        with patch("tools.llm_client.litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp) as mock_call:
+            await tool.generate(big, temperature=0.0)
+        sent = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert len(sent) <= 50
+        assert "chars omitted" in sent
+
+    @pytest.mark.asyncio
+    async def test_no_truncation_when_under_limit(self):
+        settings = _make_settings(llm_max_input_chars=0)
+        tool = LLMTool(settings=settings)
+        mock_resp = _mock_completion("ok")
+        with patch("tools.llm_client.litellm.acompletion", new_callable=AsyncMock, return_value=mock_resp) as mock_call:
+            await tool.generate("short", temperature=0.0)
+        assert mock_call.call_args.kwargs["messages"][0]["content"] == "short"
+
+
+class TestLLMToolCheapRouting:
+    def test_cheap_uses_cheap_model_when_set(self):
+        tool = LLMTool(model_type="cheap", settings=_make_settings(cheap_model="groq/llama-3.1-8b-instant"))
+        assert tool.model == "groq/llama-3.1-8b-instant"
+
+    def test_cheap_falls_back_to_llm_model_when_empty(self):
+        tool = LLMTool(model_type="cheap", settings=_make_settings(cheap_model=""))
+        assert tool.model == "gpt-4o-mini"

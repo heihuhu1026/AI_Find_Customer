@@ -587,6 +587,7 @@ async def _personalize_template_sequence(
             prompt,
             system=EMAIL_TEMPLATE_PERSONALIZER_SYSTEM,
             temperature=0.2,
+            max_tokens=800,
             response_format={"type": "json_object"},
         )
         if not isinstance(raw, str):
@@ -696,6 +697,7 @@ async def _locale_validate_emails_payload(
             validation_prompt,
             system=f"You are a strict {lang_name} language and B2B communication validator. Return only JSON.",
             temperature=0.1,
+            max_tokens=500,
             response_format={"type": "json_object"},
         )
         if not isinstance(raw, str):
@@ -756,6 +758,7 @@ async def _rewrite_email_sequence(
             rewrite_prompt,
             system=EMAIL_REWRITER_SYSTEM,
             temperature=0.2,
+            max_tokens=800,
             response_format={"type": "json_object"},
         )
         if not isinstance(raw, str):
@@ -1079,6 +1082,7 @@ async def _select_email_language(
             prompt,
             system=LANGUAGE_SELECTOR_SYSTEM,
             temperature=0.1,
+            max_tokens=300,
             response_format={"type": "json_object"},
         )
         if not isinstance(raw, str):
@@ -1160,6 +1164,7 @@ async def _synthesise_email_brief(
             prompt,
             system=BRIEF_SYNTHESIS_SYSTEM,
             temperature=0.2,
+            max_tokens=600,
             response_format={"type": "json_object"},
         )
         if not isinstance(raw, str):
@@ -1315,6 +1320,7 @@ def _build_email_tools(llm: LLMTool, locale: str) -> list[ToolDef]:
                 validation_prompt,
                 system=f"You are a strict {lang_name} language and B2B communication validator. Return only JSON.",
                 temperature=0.1,
+                max_tokens=500,
                 response_format={"type": "json_object"},
             )
             from tools.llm_output import parse_json as _parse2

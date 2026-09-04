@@ -13,27 +13,7 @@ from tools.llm_output import parse_json
 logger = logging.getLogger(__name__)
 
 
-TEMPLATE_EXTRACTOR_SYSTEM = """You analyze previous outbound emails and extract a reusable style/template profile.
-
-Do not write the final outbound sequence.
-Return JSON only.
-Focus on:
-- tone and formality
-- subject-line style
-- opening pattern
-- value proposition framing
-- CTA style
-- claims to avoid
-- reusable structure
-"""
-
-
-TEMPLATE_COMPOSER_SYSTEM = """You design a reusable outbound email template plan.
-
-Inputs may include seller ICP, buyer ICP, website insight, and optional user-provided email examples.
-Do not write the final 3-email sequence yet.
-Return JSON only.
-"""
+from tools.prompts import TEMPLATE_EXTRACTOR_SYSTEM, TEMPLATE_COMPOSER_SYSTEM
 
 
 def _clean_text(value: str) -> str:
@@ -114,6 +94,7 @@ async def extract_template_profile(
             prompt,
             system=TEMPLATE_EXTRACTOR_SYSTEM,
             temperature=0.2,
+            max_tokens=700,
             response_format={"type": "json_object"},
         )
         parsed = parse_json(raw, context="email_template_extractor")
@@ -175,6 +156,7 @@ async def compose_template_plan(
             prompt,
             system=TEMPLATE_COMPOSER_SYSTEM,
             temperature=0.2,
+            max_tokens=700,
             response_format={"type": "json_object"},
         )
         parsed = parse_json(raw, context="email_template_plan")

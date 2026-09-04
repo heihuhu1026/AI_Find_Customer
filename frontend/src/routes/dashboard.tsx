@@ -4,7 +4,7 @@ import { api, AutomationJob } from "@/api/client";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Plus, Crosshair, Users, Loader2, Globe, Clock, MapPin, Tag, Mail, Send, AlertTriangle, Workflow, Reply, Bell } from "lucide-react";
+import { Plus, Crosshair, Users, Loader2, Globe, Clock, MapPin, Tag, Mail, Send, AlertTriangle, Workflow, Reply, Bell, Copy } from "lucide-react";
 import { useMemo, useState } from "react";
 
 function formatTime(iso: string) {
@@ -93,7 +93,7 @@ export function DashboardPage() {
           <h1 className="text-3xl font-bold tracking-tight">自动化控制台</h1>
           <p className="text-muted-foreground mt-1">前端负责提交 queue job，后端 consumer 负责准备模板 seed、执行 hunt、创建 campaign 和发送队列</p>
         </div>
-        <Link to="/hunts/new">
+        <Link to="/hunts/new" search={{ fromJob: "" }}>
           <Button>
             <Plus className="h-4 w-4 mr-2" />
             新建任务
@@ -405,7 +405,7 @@ export function DashboardPage() {
             <Crosshair className="h-12 w-12 text-muted-foreground mb-4" />
           <h3 className="text-lg font-semibold mb-2">还没有排队任务</h3>
           <p className="text-muted-foreground mb-6">开始你的第一个生产者消费者任务</p>
-            <Link to="/hunts/new">
+            <Link to="/hunts/new" search={{ fromJob: "" }}>
               <Button>
                 <Plus className="h-4 w-4 mr-2" />
                 创建任务
@@ -442,6 +442,10 @@ export function DashboardPage() {
                   <Badge variant={queueStatusVariant(job)}>{getStatusLabel(job.status)}</Badge>
                 </CardHeader>
                 <CardContent className="space-y-3">
+                  <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <span className="shrink-0">任务ID</span>
+                    <span className="font-mono select-all break-all">{job.job_id}</span>
+                  </div>
                   <div className="flex items-center gap-4">
                     <div className="flex items-center gap-1.5 text-2xl font-bold">
                       <Users className="h-5 w-5 text-muted-foreground" />
@@ -485,10 +489,19 @@ export function DashboardPage() {
                   {job.last_error && (
                     <div className="text-destructive">最近错误：{job.last_error}</div>
                   )}
-                    <Link to="/automation/$jobId" params={{ jobId: job.job_id }} className="text-primary hover:underline">
-                      查看队列任务详情
-                    </Link>
-                    {detailLink}
+                    <div className="flex items-center gap-3 pt-1">
+                      <Link to="/automation/$jobId" params={{ jobId: job.job_id }} className="text-primary hover:underline">
+                        查看队列任务详情
+                      </Link>
+                      <Link
+                        to="/hunts/new"
+                        search={{ fromJob: job.job_id }}
+                        className="inline-flex items-center gap-1 text-primary hover:underline"
+                      >
+                        <Copy className="h-3.5 w-3.5" /> 复制任务
+                      </Link>
+                      {detailLink}
+                    </div>
                   </div>
                 </CardContent>
               </Card>

@@ -41,6 +41,11 @@ class SettingsPayload(BaseModel):
     serper_api_key: str = ""
     tavily_api_key: str = ""
     jina_api_key: str = ""
+    brave_api_key: str = ""
+    exa_api_key: str = ""
+    parallel_api_key: str = ""
+    serpapi_api_key: str = ""
+    search_provider_order: str = ""
     email_provider_type: str = ""
     amap_api_key: str = ""
     baidu_api_key: str = ""
@@ -191,6 +196,11 @@ async def save_settings(payload: SettingsPayload):
         "serper_api_key": "SERPER_API_KEY",
         "tavily_api_key": "TAVILY_API_KEY",
         "jina_api_key": "JINA_API_KEY",
+        "brave_api_key": "BRAVE_API_KEY",
+        "exa_api_key": "EXA_API_KEY",
+        "parallel_api_key": "PARALLEL_API_KEY",
+        "serpapi_api_key": "SERPAPI_API_KEY",
+        "search_provider_order": "SEARCH_PROVIDER_ORDER",
         "email_provider_type": "EMAIL_PROVIDER_TYPE",
         "amap_api_key": "AMAP_API_KEY",
         "baidu_api_key": "BAIDU_API_KEY",

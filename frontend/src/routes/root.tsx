@@ -1,5 +1,5 @@
 import { Link, Outlet } from "@tanstack/react-router";
-import { Crosshair, LayoutDashboard, Plus, Settings } from "lucide-react";
+import { Crosshair, LayoutDashboard, Plus, Settings, Ban, List } from "lucide-react";
 
 export function RootLayout() {
   return (
@@ -19,11 +19,26 @@ export function RootLayout() {
               任务看板
             </Link>
             <Link
+              to="/hunts"
+              className="flex items-center gap-1.5 text-muted-foreground transition-colors hover:text-foreground [&.active]:text-foreground"
+            >
+              <List className="h-4 w-4" />
+              Hunt 列表
+            </Link>
+            <Link
               to="/hunts/new"
+              search={{ fromJob: "" }}
               className="flex items-center gap-1.5 text-muted-foreground transition-colors hover:text-foreground [&.active]:text-foreground"
             >
               <Plus className="h-4 w-4" />
               新建任务
+            </Link>
+            <Link
+              to="/blacklist"
+              className="flex items-center gap-1.5 text-muted-foreground transition-colors hover:text-foreground [&.active]:text-foreground"
+            >
+              <Ban className="h-4 w-4" />
+              黑名单
             </Link>
           </nav>
           <div className="ml-auto">

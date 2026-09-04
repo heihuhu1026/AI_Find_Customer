@@ -18,8 +18,11 @@ frontend/dist/
 
 # ---------- Runtime data (kept on disk, NOT versioned) ----------
 *.db
+*.db-shm
+*.db-wal
 data/
 uploads/
+MagicMock/
 
 # ---------- Logs ----------
 *.log

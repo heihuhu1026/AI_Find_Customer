@@ -178,6 +178,40 @@ export interface HuntListItem {
   email_sequences_count: number;
 }
 
+export interface BlacklistEntry {
+  id: number;
+  customer_name: string;
+  domain: string;
+  note: string;
+  tags: string;
+  source: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface BlacklistListResult {
+  items: BlacklistEntry[];
+  total: number;
+}
+
+export interface BlacklistCheckResult {
+  valid: boolean;
+  domain: string;
+  name_key: string;
+  exists_domain: boolean;
+  exists_id: number | null;
+  suspected_name: boolean;
+  suspected_id: number | null;
+  error: string;
+}
+
+export interface BlacklistImportResult {
+  imported: number;
+  updated: number;
+  skipped: number;
+  errors: { row: number; error: string; customer_name: string }[];
+}
+
 export interface EmailCampaign {
   id: string;
   hunt_id: string;
@@ -337,9 +371,15 @@ export interface AutomationJob {
   website_url: string;
   description: string;
   product_keywords: string[];
+  target_customer_profile: string;
   target_regions: string[];
   target_lead_count: number;
+  max_rounds: number;
+  min_new_leads_threshold: number;
   enable_email_craft: boolean;
+  email_template_examples: string[];
+  email_template_notes: string;
+  uploaded_file_ids: string[];
   hunt_status: string;
   hunt_stage: string;
   hunt_error: string;
@@ -614,6 +654,65 @@ export const api = {
     request<HuntResult>(`/hunts/${huntId}/result`),
 
   listHunts: () => request<HuntListItem[]>("/hunts"),
+
+  // ── Blacklist ──────────────────────────────────────────────────────────
+  listBlacklist: (params: { q?: string; tag?: string; source?: string; page?: number; page_size?: number } = {}) => {
+    const qs = new URLSearchParams();
+    if (params.q) qs.set("q", params.q);
+    if (params.tag) qs.set("tag", params.tag);
+    if (params.source) qs.set("source", params.source);
+    if (params.page) qs.set("page", String(params.page));
+    if (params.page_size) qs.set("page_size", String(params.page_size));
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return request<BlacklistListResult>(`/blacklist${suffix}`);
+  },
+
+  checkBlacklist: (domain: string, name: string) =>
+    request<BlacklistCheckResult>(
+      `/blacklist/check?domain=${encodeURIComponent(domain)}&name=${encodeURIComponent(name)}`
+    ),
+
+  createBlacklist: (data: { customer_name: string; domain: string; note?: string; tags?: string }) =>
+    request<{ status: string; id: number; domain: string; customer_name: string }>("/blacklist", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  updateBlacklist: (id: number, data: { customer_name?: string; domain?: string; note?: string; tags?: string }) =>
+    request<BlacklistEntry>(`/blacklist/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(data),
+    }),
+
+  deleteBlacklist: (id: number) =>
+    request<void>(`/blacklist/${id}`, { method: "DELETE" }),
+
+  batchBlacklist: (data: { action: "delete" | "tag"; ids: number[]; tag?: string }) =>
+    request<{ affected: number }>("/blacklist/batch", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  importBlacklist: async (file: File): Promise<BlacklistImportResult> => {
+    const formData = new FormData();
+    formData.append("file", file);
+    const res = await fetch(`${API_BASE}/blacklist/import`, {
+      method: "POST",
+      body: formData,
+      headers: withApiAuth(),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(err.detail || res.statusText);
+    }
+    return res.json();
+  },
+
+  blacklistDownloadUrl: (kind: "export" | "template", format?: "csv" | "xlsx") => {
+    const suffix = kind === "template" && format ? `?format=${format}` : "";
+    const auth = API_ACCESS_TOKEN ? `${suffix ? "&" : "?"}api_key=${encodeURIComponent(API_ACCESS_TOKEN)}` : "";
+    return `${API_BASE}/blacklist/${kind === "template" ? "template" : "export"}${suffix}${auth}`;
+  },
 
   uploadFiles: async (files: File[]): Promise<UploadedFile[]> => {
     const formData = new FormData();

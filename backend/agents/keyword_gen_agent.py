@@ -13,30 +13,7 @@ from agents.search_agent import _REGION_GEO
 
 logger = logging.getLogger(__name__)
 
-KEYWORD_GEN_SYSTEM_PROMPT = """You are an expert B2B keyword strategist specializing in Google Maps search. Generate search keywords and business categories to find potential B2B buyers, distributors, importers, and wholesalers for a specific product.
-
-## Keyword Dimension Coverage for Google Maps
-Each batch of {n} keywords MUST cover multiple dimensions — do NOT generate all keywords from the same dimension:
-
-1. **Local Buyer Role + City/Region** — e.g. "solar inverter distributor Berlin", "PV module importer Warsaw"
-2. **Business Category + City/Region** — e.g. "electrical equipment wholesaler Munich", "renewable energy installer Paris"
-3. **Product + Wholesale/Trade** — e.g. "industrial machinery wholesale Lyon", "LED lighting supplier Madrid"
-4. **Niche Application + Service** — e.g. "off-grid solar system provider Milan", "EV charger installation company London"
-5. **Local Competitor/Market Keywords** — e.g. "renewable energy storage systems retailer", "photovoltaic equipment merchant"
-
-## Rules
-1. Generate exactly {n} keywords as a JSON array of strings.
-2. Each keyword must be a specific, search-ready phrase (2-5 words) optimized for Google Maps.
-3. Do NOT repeat any previously used keywords.
-4. Every keyword MUST target the specified regions — never generate keywords for other regions.
-5. Focus on finding PHYSICAL businesses (distributors, wholesalers, showrooms, retailers).
-6. If feedback is provided: generate MORE keywords similar to high-performing ones, AVOID patterns of low-performing ones.
-
-## Local Language Requirement
-{local_language_instruction}
-
-Output MUST be a valid JSON object with a "keywords" key containing an array of strings:
-{{"keywords": ["solar inverter distributor Berlin", "electrical equipment wholesaler Munich", ...]}}"""
+from tools.prompts import KEYWORD_GEN_SYSTEM_PROMPT
 
 
 # ── Language detection ───────────────────────────────────────────────────
@@ -246,6 +223,7 @@ async def keyword_gen_node(state: HuntState) -> dict:
     )
 
     llm = LLMTool(
+        model_type="cheap",
         hunt_id=state.get("hunt_id", ""),
         agent="keyword_gen",
         hunt_round=state.get("hunt_round", 0),
@@ -254,7 +232,8 @@ async def keyword_gen_node(state: HuntState) -> dict:
         raw = await llm.generate(
             prompt,
             system=system,
-            temperature=0.5,
+            temperature=0.2,
+            max_tokens=800,
             response_format={"type": "json_object"},
         )
 

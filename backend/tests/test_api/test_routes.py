@@ -20,6 +20,14 @@ def _mock_save_hunt():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _mock_load_all_hunts():
+    # list_hunts now merges in-memory _hunts with on-disk hunts; isolate tests
+    # from the operator's real data/hunts directory.
+    with patch("api.routes.load_all_hunts", return_value={}):
+        yield
+
+
 @pytest.fixture
 def app():
     """Create a fresh app instance per test."""
@@ -752,6 +760,27 @@ class TestListHunts:
         data = resp.json()
         item = next(x for x in data if x["hunt_id"] == "dup-list")
         assert item["leads_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_list_merges_disk_hunts(self, client):
+        """Hunts persisted on disk (e.g. executed directly, no queue job) must appear."""
+        disk_hunt = {
+            "status": "completed",
+            "result": {"leads": [{"company_name": "Disk Co", "website": "https://diskco.com"}]},
+            "leads_count": 1,
+            "created_at": "2026-03-08T00:00:00+00:00",
+            "website_url": "https://diskco.com",
+            "product_keywords": ["pv panel"],
+            "target_customer_profile": "",
+            "target_regions": [],
+            "hunt_round": 1,
+            "email_sequences_count": 0,
+        }
+        _hunts.clear()
+        with patch("api.routes.load_all_hunts", return_value={"disk-hunt": disk_hunt}):
+            resp = await client.get("/api/v1/hunts")
+        data = resp.json()
+        assert any(x["hunt_id"] == "disk-hunt" and x["website_url"] == "https://diskco.com" for x in data)
 
 
 # ── _slim_state unit tests ───────────────────────────────────────────────

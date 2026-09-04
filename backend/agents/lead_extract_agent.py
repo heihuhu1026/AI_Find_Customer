@@ -37,6 +37,8 @@ from tools.email_finder import extract_emails_from_text
 from tools.email_verifier import EmailVerifierTool
 from tools.google_search import GoogleSearchTool
 from tools.jina_reader import JinaReaderTool
+from tools.blacklist_store import load_blocked_domains
+from tools.crawl_registry import normalize_domain
 from tools.llm_client import LLMTool
 from tools.llm_output import parse_json
 from tools.customs_router import find_customs_data as route_customs_data
@@ -574,6 +576,7 @@ async def _quick_gate_candidate(search_result: dict, llm: LLMTool, insight: dict
             prompt,
             system=QUICK_GATE_PROMPT,
             temperature=0.0,
+            max_tokens=400,
             response_format={"type": "json_object"},
         )
         if not isinstance(raw, str):
@@ -756,6 +759,7 @@ def _build_react_tools(
                 prompt,
                 system=LEAD_EXTRACT_PROMPT,
                 temperature=0.1,
+                max_tokens=600,
                 response_format={"type": "json_object"},
             )
             return raw
@@ -833,6 +837,7 @@ def _build_react_tools(
                 prompt,
                 system=LEAD_ASSESS_PROMPT,
                 temperature=0.1,
+                max_tokens=600,
                 response_format={"type": "json_object"},
             )
             return raw
@@ -1218,8 +1223,12 @@ async def lead_extract_node(state: HuntState) -> dict:
         d for d in (_official_website_domain(l.get("website", "")) for l in existing_leads)
         if d
     }
+    # Layer 1 blacklist filter — drop blacklisted domains before the (expensive)
+    # quick-gate + ReAct deep extraction.
+    blocked_domains = load_blocked_domains(settings)
     to_process = []
     seen_candidate_domains: set[str] = set(existing_domains)
+    blacklisted_count = 0
     for r in search_results:
         link = r.get("link", "")
         maps_title = (r.get("title") or (r.get("maps_data") or {}).get("title") or "").strip()
@@ -1228,11 +1237,18 @@ async def lead_extract_node(state: HuntState) -> dict:
         link_official_domain = _official_website_domain(link)
         if link_official_domain and link_official_domain in existing_domains:
             continue
+        if link_official_domain and link_official_domain in blocked_domains:
+            blacklisted_count += 1
+            logger.info("[LeadExtract] blacklist skip domain=%s", link_official_domain)
+            _emit_progress("blacklist_filtered", domain=link_official_domain, reason="blacklist")
+            continue
         if link_official_domain and link_official_domain in seen_candidate_domains:
             continue
         if link_official_domain:
             seen_candidate_domains.add(link_official_domain)
         to_process.append(r)
+    if blacklisted_count:
+        logger.info("[LeadExtract] filtered %d blacklisted candidates", blacklisted_count)
 
     # Filter out truly irrelevant URLs (search engines, entertainment)
     processable = [
@@ -1263,22 +1279,33 @@ async def lead_extract_node(state: HuntState) -> dict:
         processable = processable[:candidate_budget]
 
     semaphore = asyncio.Semaphore(settings.scrape_concurrency)
-    jina = JinaReaderTool()
     hunt_id = state.get("hunt_id", "")
     hunt_round = state.get("hunt_round", 0)
+    own_url = state.get("website_url", "") or ""
+    jina = JinaReaderTool(
+        hunt_id=hunt_id,
+        own_domains={normalize_domain(own_url)} - {""},
+    )
     llm = LLMTool(
         hunt_id=hunt_id,
         agent="lead_extract",
+        hunt_round=hunt_round,
+    )
+    # Cheap model for the high-volume per-candidate pre-filter classification.
+    gate_llm = LLMTool(
+        model_type="cheap",
+        hunt_id=hunt_id,
+        agent="lead_gate",
         hunt_round=hunt_round,
     )
     google = GoogleSearchTool()
 
     try:
         # ── Quick Gate: low-cost pre-filter before deep ReAct ───────────
-        async def _run_gate(r: dict) -> tuple[dict, bool, dict]:
+        async def _run_gate(r: dict, gate_llm: LLMTool) -> tuple[dict, bool, dict]:
             async with semaphore:
                 try:
-                    passed, gate = await _quick_gate_candidate(r, llm, insight)
+                    passed, gate = await _quick_gate_candidate(r, gate_llm, insight)
                     return r, passed, gate
                 except Exception as e:
                     logger.warning("[LeadExtract][QuickGate] gate failed, fallback keep: %s", e)
@@ -1286,7 +1313,7 @@ async def lead_extract_node(state: HuntState) -> dict:
 
         gated_candidates: list[dict] = []
         filtered_count = 0
-        gate_tasks = [_run_gate(r) for r in processable]
+        gate_tasks = [_run_gate(r, gate_llm) for r in processable]
         for future in asyncio.as_completed(gate_tasks):
             row, passed, gate = await future
             if passed:
@@ -1362,6 +1389,7 @@ async def lead_extract_node(state: HuntState) -> dict:
     finally:
         await jina.close()
         await llm.close()
+        await gate_llm.close()
         await google.close()
 
     # ── Collect valid leads, deduplicate ─────────────────────────────────

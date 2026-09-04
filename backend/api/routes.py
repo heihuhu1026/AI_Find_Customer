@@ -124,6 +124,7 @@ class HuntRequest(BaseModel):
     email_template_examples: list[str] = Field(default_factory=list, description="Optional historical outreach emails or template samples from the user")
     email_template_notes: str = Field(default="", description="Optional notes about preferred style, offer, or constraints")
     template_seed: dict[str, Any] | None = None
+    force: bool = Field(default=False, description="忽略目标站重复检查，强制重新调度")
 
 
 class ResumeRequest(BaseModel):
@@ -707,28 +708,42 @@ async def _run_hunt(hunt_id: str, request: HuntRequest) -> None:
         remove_tracker(hunt_id)
         accumulated["cost_summary"] = cost_summary
 
+        final_leads = _unique_leads_count(accumulated.get("leads", []))
+        if accumulated.get("search_failed") and final_leads == 0:
+            final_status = "failed"
+            final_error = accumulated.get("search_error") or (
+                "All search providers failed; no leads could be discovered."
+            )
+        else:
+            final_status = "completed"
+            final_error = None
+
         _hunts[hunt_id].update({
-            "status": "completed",
+            "status": final_status,
+            "error": final_error,
             "result": accumulated,
             "current_stage": accumulated.get("current_stage", "done"),
             "hunt_round": accumulated.get("hunt_round", 0),
-            "leads_count": _unique_leads_count(accumulated.get("leads", [])),
+            "leads_count": final_leads,
             "email_sequences_count": len(accumulated.get("email_sequences", [])),
             "completed_at": now_iso(),
             "cost_summary": cost_summary,
         })
         save_hunt(hunt_id, _hunts[hunt_id])
 
-        logger.info("[Hunt %s] Completed — %d leads, %d email sequences, %d rounds",
-                    hunt_id[:8], _unique_leads_count(accumulated.get("leads", [])),
+        logger.info("[Hunt %s] %s — %d leads, %d email sequences, %d rounds",
+                    hunt_id[:8], final_status.capitalize(), final_leads,
                     len(accumulated.get("email_sequences", [])),
                     accumulated.get("hunt_round", 0))
 
-        _broadcast(hunt_id, "completed", {
-            "leads_count": _unique_leads_count(accumulated.get("leads", [])),
-            "email_sequences_count": len(accumulated.get("email_sequences", [])),
-            "hunt_round": accumulated.get("hunt_round", 0),
-        })
+        if final_status == "failed":
+            _broadcast(hunt_id, "failed", {"error": final_error})
+        else:
+            _broadcast(hunt_id, "completed", {
+                "leads_count": final_leads,
+                "email_sequences_count": len(accumulated.get("email_sequences", [])),
+                "hunt_round": accumulated.get("hunt_round", 0),
+            })
 
     except HuntCancelledError as e:
         logger.warning("[Hunt %s] Cancelled: %s", hunt_id[:8], e)
@@ -954,28 +969,41 @@ async def _run_resume_hunt(hunt_id: str, request: ResumeRequest, prior_result: d
                 })
                 _raise_if_hunt_cancelled(hunt_id)
 
+        final_leads = _unique_leads_count(accumulated.get("leads", []))
+        if accumulated.get("search_failed") and final_leads == 0:
+            final_status = "failed"
+            final_error = accumulated.get("search_error") or (
+                "All search providers failed; no leads could be discovered."
+            )
+        else:
+            final_status = "completed"
+            final_error = None
+
         _hunts[hunt_id].update({
-            "status": "completed",
+            "status": final_status,
+            "error": final_error,
             "result": accumulated,
             "current_stage": accumulated.get("current_stage", "done"),
             "hunt_round": accumulated.get("hunt_round", 0),
-            "leads_count": _unique_leads_count(accumulated.get("leads", [])),
+            "leads_count": final_leads,
             "email_sequences_count": len(accumulated.get("email_sequences", [])),
             "completed_at": now_iso(),
         })
         save_hunt(hunt_id, _hunts[hunt_id])
 
         logger.info(
-            "[Hunt %s] Resume completed — %d leads, %d rounds",
-            hunt_id[:8],
-            _unique_leads_count(accumulated.get("leads", [])),
+            "[Hunt %s] Resume %s — %d leads, %d rounds",
+            hunt_id[:8], final_status, final_leads,
             accumulated.get("hunt_round", 0),
         )
-        _broadcast(hunt_id, "completed", {
-            "leads_count": _unique_leads_count(accumulated.get("leads", [])),
-            "email_sequences_count": len(accumulated.get("email_sequences", [])),
-            "hunt_round": accumulated.get("hunt_round", 0),
-        })
+        if final_status == "failed":
+            _broadcast(hunt_id, "failed", {"error": final_error})
+        else:
+            _broadcast(hunt_id, "completed", {
+                "leads_count": final_leads,
+                "email_sequences_count": len(accumulated.get("email_sequences", [])),
+                "hunt_round": accumulated.get("hunt_round", 0),
+            })
 
     except HuntCancelledError as e:
         logger.warning("[Hunt %s] Resume cancelled: %s", hunt_id[:8], e)
@@ -1074,6 +1102,12 @@ async def prepare_email_template_seed(request: TemplateSeedRequest):
 
 
 def _initialize_hunt(request: HuntRequest) -> tuple[str, HuntRequest]:
+    # The target website (request.website_url) is the user's OWN company
+    # homepage, not a discovered lead. It must never be blocked by cross-hunt
+    # de-duplication — re-running analysis on the same company site is allowed.
+    # De-dup applies only to customer sites discovered via keyword search
+    # (handled softly in tools.jina_reader, which skips already-crawled
+    # customer domains and continues with the rest).
     uploaded_file_ids = _validate_uploaded_file_ids(request.uploaded_file_ids)
     hunt_id = str(uuid.uuid4())
     _hunts[hunt_id] = {
@@ -1338,13 +1372,25 @@ async def detect_email_sequence_replies(
 
 @router.get("/hunts", dependencies=[Depends(require_api_access)])
 async def list_hunts():
-    """List all hunts with their status."""
-    items = []
+    """List all hunts with their status.
+
+    Merges the in-memory ``_hunts`` (live/current process) with every hunt
+    persisted on disk (``data/hunts/*.json``) so hunts that were executed
+    directly — without an automation queue job — or from a previous process
+    are still discoverable.
+    """
+    merged: dict[str, dict] = {}
+    for hid, h in load_all_hunts().items():
+        merged[hid] = h
     for hid, h in _hunts.items():
+        merged[hid] = h
+
+    items = []
+    for hid, h in merged.items():
         result = h.get("result") or {}
         items.append({
             "hunt_id": hid,
-            "status": h["status"],
+            "status": h.get("status", ""),
             "leads_count": _unique_leads_count(result.get("leads", [])),
             "created_at": h.get("created_at", ""),
             "website_url": h.get("website_url", ""),

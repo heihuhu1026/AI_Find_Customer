@@ -31,6 +31,7 @@ from config.settings import get_settings
 from graph.state import HuntState
 from tools.google_search import GoogleSearchTool
 from tools.jina_reader import JinaReaderTool
+from tools.crawl_registry import normalize_domain
 from tools.pdf_parser import PDFParserTool
 from tools.excel_parser import ExcelParserTool
 from tools.react_runner import ToolDef, react_loop
@@ -634,7 +635,10 @@ async def insight_node(state: HuntState) -> dict:
     )
 
     # ── Step 3: Build tools and run single ReAct loop ──────────────────
-    jina = JinaReaderTool()
+    jina = JinaReaderTool(
+        hunt_id=state.get("hunt_id", ""),
+        own_domains={normalize_domain(website_url)} - {""},
+    )
     google = GoogleSearchTool()
 
     try:

@@ -22,7 +22,13 @@ import litellm
 
 from config.settings import Settings, get_settings
 from tools.llm_errors import format_llm_error
-from tools.llm_client import _inject_api_keys, normalize_model_name
+from tools.llm_client import (
+    _inject_api_keys,
+    _is_retryable_rate_limit_error,
+    _split_fallback_models,
+    normalize_model_name,
+    truncate_for_llm,
+)
 from tools.llm_rate_limiter import get_llm_rate_limiter
 
 logger = logging.getLogger(__name__)
@@ -46,6 +52,60 @@ async def _acompletion_with_rpm_limit(
         rpm = settings.reasoning_requests_per_minute or settings.llm_requests_per_minute
     await get_llm_rate_limiter(scope, rpm).acquire()
     return await litellm.acompletion(**kwargs)
+
+
+def _reasoning_candidate_models(settings: Settings, scope: str) -> list[str]:
+    """Ordered model list for ReAct: primary → reasoning fallback chain → cheap (Ollama).
+
+    Mirrors ``LLMTool._candidate_models`` for the reasoning scopes so ReAct calls
+    get the same quota-exhaustion auto-failover as the plain LLM tool.
+    """
+    if scope == "email_reasoning":
+        primary = settings.email_reasoning_model or settings.reasoning_model
+        fb = settings.reasoning_model_fallback
+    else:
+        primary = settings.reasoning_model
+        fb = settings.reasoning_model_fallback
+
+    cands: list[str] = []
+    if primary:
+        cands.append(normalize_model_name(primary))
+    for m in _split_fallback_models(fb):
+        m = normalize_model_name(m)
+        if m not in cands:
+            cands.append(m)
+    cheap = normalize_model_name(settings.cheap_model) if settings.cheap_model else ""
+    if cheap and cheap not in cands:
+        cands.append(cheap)
+    return cands
+
+
+async def _call_with_model_failover(
+    settings: Settings,
+    *,
+    scope: str,
+    candidate_models: list[str],
+    **kwargs: Any,
+) -> tuple[str, Any]:
+    """Call litellm, walking the candidate chain on quota / rate-limit failures.
+
+    Returns ``(model_used, response)``. Raises the first non-retryable error, or
+    the last retryable error when every candidate is exhausted.
+    """
+    last_exc: Exception | None = None
+    for model in candidate_models:
+        call_kwargs = dict(kwargs)
+        call_kwargs["model"] = model
+        try:
+            response = await _acompletion_with_rpm_limit(settings, scope=scope, **call_kwargs)
+            return model, response
+        except Exception as exc:
+            last_exc = exc
+            if not _is_retryable_rate_limit_error(exc):
+                raise
+            logger.warning("[ReAct] model %s unavailable (%s); trying next candidate", model, exc)
+            continue
+    raise (last_exc if last_exc is not None else RuntimeError("no candidate models configured"))
 
 
 def _clean_markdown_fences(text: str) -> str:
@@ -231,10 +291,8 @@ async def react_loop(
     """
     _settings = settings or get_settings()
     max_iter = max_iterations or _settings.react_max_iterations
-    if model_scope == "email_reasoning":
-        model = normalize_model_name(_settings.email_reasoning_model or _settings.reasoning_model)
-    else:
-        model = normalize_model_name(_settings.reasoning_model)
+    candidate_models = _reasoning_candidate_models(_settings, model_scope)
+    model = candidate_models[0] if candidate_models else ""
     temperature = _settings.reasoning_temperature
     max_tokens = _settings.reasoning_max_tokens
 
@@ -247,7 +305,7 @@ async def react_loop(
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system},
-        {"role": "user", "content": user_prompt},
+        {"role": "user", "content": truncate_for_llm(user_prompt, _settings.llm_max_input_chars)},
     ]
 
     for iteration in range(1, max_iter + 1):
@@ -256,7 +314,6 @@ async def react_loop(
         # On the last allowed iteration, don't offer tools — force a text answer
         is_last = iteration == max_iter
         kwargs: dict[str, Any] = {
-            "model": model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -277,7 +334,9 @@ async def react_loop(
             })
 
         try:
-            response = await _acompletion_with_rpm_limit(_settings, scope=model_scope, **kwargs)
+            model, response = await _call_with_model_failover(
+                _settings, scope=model_scope, candidate_models=candidate_models, **kwargs
+            )
             _record_react_cost(response, hunt_id, agent, model, hunt_round)
         except Exception as e:
             # Fallback for last iteration: some Anthropic-compatible APIs (e.g. MiniMax)
@@ -289,12 +348,13 @@ async def react_loop(
                 )
                 try:
                     fallback_kwargs = {
-                        "model": model,
                         "messages": _strip_tool_messages(messages),
                         "temperature": temperature,
                         "max_tokens": max_tokens,
                     }
-                    response = await _acompletion_with_rpm_limit(_settings, scope=model_scope, **fallback_kwargs)
+                    model, response = await _call_with_model_failover(
+                        _settings, scope=model_scope, candidate_models=candidate_models, **fallback_kwargs
+                    )
                     _record_react_cost(response, hunt_id, agent, model, hunt_round)
                 except Exception as e2:
                     formatted = format_llm_error(e2)
@@ -405,7 +465,7 @@ async def react_loop(
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
-                "content": result,
+                "content": truncate_for_llm(result, _settings.llm_max_input_chars),
             })
 
     # Exhausted iterations — ask for final answer without tools

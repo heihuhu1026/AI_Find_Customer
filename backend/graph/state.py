@@ -40,6 +40,11 @@ class HuntState(TypedDict):
     seen_urls: list[str]                    # deduplicated URL set — survives resume compression
     matched_platforms: list[dict]           # B2B platforms matched to ICP
     keyword_search_stats: dict[str, Any]    # per-keyword search effectiveness
+    # Search diagnostics — surfaced so a fully-failed search is never misreported
+    # as a successful 0-lead run.
+    search_failed: bool                     # True if EVERY provider errored for EVERY keyword
+    search_error: str                       # human-readable summary of the search failure
+    search_provider_status: dict[str, Any]  # per-provider "ok" / "error: ..." status
 
     # ── Stage 4: Leads (accumulated across rounds) ──────────────────────
     leads: list[dict]

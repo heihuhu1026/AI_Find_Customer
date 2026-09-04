@@ -13,6 +13,7 @@ from api.routes import _hunts, request_hunt_cancel, _unique_leads_count
 from api.security import require_api_access
 from automation.job_queue import HuntJobQueue
 from automation.metrics import collect_automation_metrics, collect_automation_status
+from tools.crawl_registry import check_target_site_duplicate
 from config.settings import get_settings
 from emailing.store import EmailStore
 
@@ -33,6 +34,7 @@ class AutomationJobRequest(BaseModel):
     enable_email_craft: bool = False
     email_template_examples: list[str] = Field(default_factory=list)
     email_template_notes: str = ""
+    force: bool = Field(default=False, description="忽略目标站重复检查，强制重新调度")
 
 
 class AutomationJobContinueRequest(BaseModel):
@@ -42,6 +44,7 @@ class AutomationJobContinueRequest(BaseModel):
     enable_email_craft: bool = False
     email_template_examples: list[str] = Field(default_factory=list)
     email_template_notes: str = ""
+    force: bool = Field(default=False, description="忽略目标站重复检查，强制重新调度")
 
 
 def _queue() -> HuntJobQueue:
@@ -187,9 +190,15 @@ def _serialize_job(job: dict[str, Any]) -> dict[str, Any]:
         "website_url": str(payload.get("website_url", "") or ""),
         "description": str(payload.get("description", "") or ""),
         "product_keywords": list(payload.get("product_keywords", []) or []),
+        "target_customer_profile": str(payload.get("target_customer_profile", "") or ""),
         "target_regions": list(payload.get("target_regions", []) or []),
         "target_lead_count": int(payload.get("target_lead_count", 0) or 0),
+        "max_rounds": int(payload.get("max_rounds", 0) or 0),
+        "min_new_leads_threshold": int(payload.get("min_new_leads_threshold", 0) or 0),
         "enable_email_craft": bool(payload.get("enable_email_craft", False)),
+        "email_template_examples": list(payload.get("email_template_examples", []) or []),
+        "email_template_notes": str(payload.get("email_template_notes", "") or ""),
+        "uploaded_file_ids": list(payload.get("uploaded_file_ids", []) or []),
         "hunt_status": str((hunt or {}).get("status", "") or ""),
         "hunt_stage": str((hunt or {}).get("current_stage", "") or ""),
         "hunt_error": str((hunt or {}).get("error", "") or ""),
@@ -206,6 +215,11 @@ def _serialize_job(job: dict[str, Any]) -> dict[str, Any]:
 
 @router.post("/jobs", dependencies=[Depends(require_api_access)])
 async def create_automation_job(request: AutomationJobRequest):
+    # The target website is the user's OWN company homepage, not a discovered
+    # lead. Cross-hunt de-dup must NOT block re-running analysis on it; the
+    # check below is informational only (surfaced via result["target_site_check"]).
+    settings = get_settings()
+    dup = check_target_site_duplicate(request.website_url, settings=settings)
     queue = _queue()
     job_id = queue.enqueue(request.model_dump(), now_iso=now_iso())
     logger.info(
@@ -216,7 +230,9 @@ async def create_automation_job(request: AutomationJobRequest):
         request.enable_email_craft,
     )
     job = queue.get(job_id)
-    return _serialize_job(job or {"id": job_id, "payload": request.model_dump()})
+    result = _serialize_job(job or {"id": job_id, "payload": request.model_dump()})
+    result["target_site_check"] = dup
+    return result
 
 
 @router.get("/jobs", dependencies=[Depends(require_api_access)])
@@ -269,9 +285,18 @@ async def create_automation_job_from_hunt(hunt_id: str, request: AutomationJobCo
     }
 
     queue = _queue()
+    # Soft, informational only — never block re-running on the user's own site.
+    settings = get_settings()
+    dup = check_target_site_duplicate(
+        str(payload.get("website_url", "") or ""),
+        exclude_hunt_id=hunt_id,
+        settings=settings,
+    )
     job_id = queue.enqueue(next_payload, now_iso=now_iso())
     job = queue.get(job_id)
-    return _serialize_job(job or {"id": job_id, "payload": next_payload})
+    result = _serialize_job(job or {"id": job_id, "payload": next_payload})
+    result["target_site_check"] = dup
+    return result
 
 
 @router.post("/jobs/{job_id}/cancel", dependencies=[Depends(require_api_access)])
